@@ -1,0 +1,29 @@
+{
+  "name": "keylease-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monorepo for the KeyLease developer CLI (@keylease/cli) and the edge reverse proxy (@keylease/proxy) that gates upstream APIs behind on-chain Soroban leases.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "packageManager": "pnpm@12.3.4",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm build && pnpm -r typecheck",
+    "lint": "eslint .",
+    "test": "pnpm -r test",
+    "test:watch": "pnpm -r --parallel test:watch",
+    "clean": "pnpm -r exec rm -rf dist coverage *.tsbuildinfo"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.0.0",
+    "globals": "^16.0.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^3.0.0"
+  }
+}

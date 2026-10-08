@@ -1,0 +1,36 @@
+{
+  "name": "@keylease/proxy",
+  "version": "0.1.0",
+  "description": "KeyLease edge reverse proxy: verifies Soroban lease bearer tokens and gates access to upstream APIs.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@keylease/cli": "workspace:*",
+    "fastify": "^5.6.0"
+  },
+  "devDependencies": {
+    "@stellar/stellar-sdk": "^13.3.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  }
+}
