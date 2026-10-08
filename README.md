@@ -181,6 +181,32 @@ Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
 
 ---
 
+## Deployments
+
+Nothing in this project holds mainnet value until an audit is announced (see
+[SECURITY.md](./SECURITY.md)). Current deployment status:
+
+| Component | Network / host | Address or URL |
+| --- | --- | --- |
+| `keylease-core` registry contract | Stellar Testnet | Not deployed yet — contract ID + explorer link go here and in the [release notes](https://github.com/KeyLease-Security/keylease-gateway/releases) |
+| Reference `@keylease/proxy` instance | – | Not hosted yet — run locally per [Quickstart](#quickstart) |
+| `@keylease/cli` | npm registry | Not published (`@keylease` scope) — install from source per [Development](#development) |
+
+How each row gets filled:
+
+1. **Contract** — build and deploy per the
+   [keylease-core Quickstart](https://github.com/KeyLease-Security/keylease-core#quickstart):
+   `cargo build --target wasm32v1-none --release`, then
+   `stellar contract deploy --network testnet`, then `init` / `set_token`.
+   The `C...` ID lands here, in the release notes, and in `KEYLEASE_CONTRACT_ID`.
+2. **Proxy** — any long-running Node host (Render, Fly.io, Railway, a VM):
+   `pnpm install && pnpm --filter @keylease/proxy start` with
+   `KEYLEASE_UPSTREAM_URL`, `KEYLEASE_CONTRACT_ID` and (for testnet)
+   `KEYLEASE_RPC_URL` set. The public base URL lands here plus a demo `curl`
+   that returns `x-keylease-calls-remaining`.
+3. **CLI** — `npm publish` under the `@keylease` scope; until then install
+   from source.
+
 ## Repository layout
 
 ```
