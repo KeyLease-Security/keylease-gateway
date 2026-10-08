@@ -4,7 +4,7 @@
 
 ## Linked issue
 
-<!-- Drips Wave: "Fixes #123" -->
+<!-- "Fixes #123" -->
 
 Fixes #
 

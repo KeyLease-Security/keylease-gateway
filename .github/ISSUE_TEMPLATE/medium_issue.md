@@ -1,8 +1,8 @@
 ---
-name: "Wave · Medium (150 pts)"
+name: "Medium (150 pts)"
 about: A feature or refactor that spans a package but stays within one clear boundary.
 title: "[medium] "
-labels: ["wave/medium", "points/150"]
+labels: ["size/medium", "points/150"]
 ---
 
 ## Summary

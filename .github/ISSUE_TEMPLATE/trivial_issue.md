@@ -1,8 +1,8 @@
 ---
-name: "Wave · Trivial (100 pts)"
+name: "Trivial (100 pts)"
 about: A small, well-scoped task that one contributor can finish in a single sitting.
 title: "[trivial] "
-labels: ["wave/trivial", "points/100"]
+labels: ["size/trivial", "points/100"]
 ---
 
 ## Summary
@@ -15,7 +15,7 @@ labels: ["wave/trivial", "points/100"]
 
 ## Scope
 
-Keep this tight — a trivial wave issue should be reviewable in minutes.
+Keep this tight — a trivial issue should be reviewable in minutes.
 
 - Files likely touched:
 - Explicitly out of scope:

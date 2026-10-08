@@ -54,25 +54,26 @@ packages/proxy/src
 ## Commit and PR hygiene
 
 - One logical change per PR; keep diffs reviewable.
-- Fill in the pull request template; link the Drips Wave issue you are
-  claiming (`Fixes #123`).
+- Fill in the pull request template; link the issue you are claiming
+  (`Fixes #123`).
 - CI must be green: `pnpm lint` → `pnpm build` → `tsc --noEmit` → `pnpm test`.
 - Never commit secrets: `.env`, Stellar secret seeds or session tokens are
   git-ignored for a reason.
 
 ## Reporting issues
 
-Pick the matching Drips Wave template:
+Pick the matching issue template:
 
-| Template                         | Effort        | Points  |
-| -------------------------------- | ------------- | ------- |
-| `wave_trivial_issue.md`          | Single sitting | 100 pts |
-| `wave_medium_issue.md`           | One package    | 150 pts |
-| `wave_high_issue.md`             | Cross-cutting / security | 200 pts |
+| Template                 | Effort                       | Points  |
+| ------------------------ | ---------------------------- | ------- |
+| `trivial_issue.md`       | Single sitting               | 100 pts |
+| `medium_issue.md`        | One package                  | 150 pts |
+| `high_issue.md`          | Cross-cutting / security     | 200 pts |
 
 Security-sensitive reports (token forgery, quota bypass, RPC spoofing) belong
-in a **high** issue: describe the threat model, the reproduction and the
-expected failure mode.
+in a **high** issue — or, better, in a private report per
+[SECURITY.md](./SECURITY.md): describe the threat model, the reproduction and
+the expected failure mode.
 
 ## Testing conventions
 

@@ -1,8 +1,19 @@
 # keylease-gateway
 
+[![CI](https://github.com/KeyLease-Security/keylease-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/KeyLease-Security/keylease-gateway/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20.11-brightgreen.svg)](https://nodejs.org)
+[![pnpm](https://img.shields.io/badge/pnpm-12-orange.svg)](https://pnpm.io)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178c6.svg)](https://www.typescriptlang.org/)
+[![Soroban](https://img.shields.io/badge/Soroban-SDK-8A2BE2.svg)](https://soroban.stellar.org)
+
 TypeScript workspace for **KeyLease**: a developer CLI that acquires API leases
 on the Soroban `keylease-core` contract, and an edge reverse proxy that verifies
 those leases before any request is allowed to reach a protected upstream API.
+
+> On-chain half of the project: [**keylease-core**](https://github.com/KeyLease-Security/keylease-core)
+> — the Soroban registry contract (`create_lease`, escrow, settlement) this CLI
+> calls and the proxy reads lease state from.
 
 ```
 packages/cli    →  @keylease/cli     keylease acquire / env / status
@@ -176,7 +187,7 @@ Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
 keylease-gateway/
 ├── .github/
 │   ├── workflows/ci.yml               # lint → build → tsc --noEmit → test
-│   ├── ISSUE_TEMPLATE/                # wave trivial (100) / medium (150) / high (200)
+│   ├── ISSUE_TEMPLATE/                # issue templates: trivial (100) / medium (150) / high (200)
 │   └── pull_request_template.md
 ├── packages/
 │   ├── cli/                           # @keylease/cli
@@ -215,6 +226,31 @@ Lease entry stored under `Vec[Symbol("lease"), String(lease_id)]`:
 service: String, consumer: Address, calls_limit: U32,
 calls_used: U32, expires_at: U64 (unix seconds), active: Bool
 ```
+
+## Contributing
+
+PRs welcome — read [CONTRIBUTING.md](./CONTRIBUTING.md) for setup, coding
+conventions and the issue templates (trivial 100 / medium 150 / high 200
+points). Found a security issue (token forgery, quota bypass, RPC spoofing)?
+Follow [SECURITY.md](./SECURITY.md) instead of opening a public issue.
+
+## Community
+
+Questions, ideas, or just want to follow along? Open a
+[GitHub issue](https://github.com/KeyLease-Security/keylease-gateway/issues) —
+everything is tracked in the open.
+
+## Maintainers
+
+| Maintainer | Role | Contact |
+| --- | --- | --- |
+| [KeyLease-Security](https://github.com/KeyLease-Security) | Project owner | [GitHub issues](https://github.com/KeyLease-Security/keylease-gateway/issues) |
+
+## Contributors
+
+<a href="https://github.com/KeyLease-Security/keylease-gateway/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=KeyLease-Security/keylease-gateway" alt="Contributors" />
+</a>
 
 ## License
 

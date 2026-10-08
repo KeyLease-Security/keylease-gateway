@@ -1,8 +1,8 @@
 ---
-name: "Wave · High (200 pts)"
+name: "High (200 pts)"
 about: Cross-cutting work affecting security, protocol correctness or multiple packages.
 title: "[high] "
-labels: ["wave/high", "points/200"]
+labels: ["size/high", "points/200"]
 ---
 
 ## Summary
