@@ -53,7 +53,7 @@ export interface NetworkConfig {
 export const NETWORKS: Record<string, NetworkConfig> = {
   testnet: {
     name: 'testnet',
-    rpcUrl: 'https://soroban-testnet.stellar.com',
+    rpcUrl: 'https://soroban-testnet.stellar.org',
     networkPassphrase: 'Test SDF Network ; September 2015',
   },
   mainnet: {

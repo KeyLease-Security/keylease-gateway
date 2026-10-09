@@ -188,7 +188,7 @@ Nothing in this project holds mainnet value until an audit is announced (see
 
 | Component | Network / host | Address or URL |
 | --- | --- | --- |
-| `keylease-core` registry contract | Stellar Testnet | Not deployed yet — contract ID + explorer link go here and in the [release notes](https://github.com/KeyLease-Security/keylease-gateway/releases) |
+| `keylease-core` registry contract | Stellar Testnet | [`CC7BTFSJHYCRYQSMERO6E4VW3DPKTDEBP4YRCFJ5GS54JOMA4VRF45OT`](https://stellar.expert/explorer/testnet/contract/CC7BTFSJHYCRYQSMERO6E4VW3DPKTDEBP4YRCFJ5GS54JOMA4VRF45OT) — service `1` registered; escrow token (native SAC) `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC` |
 | Reference `@keylease/proxy` instance | – | Not hosted yet — run locally per [Quickstart](#quickstart) |
 | `@keylease/cli` | npm registry | Not published (`@keylease` scope) — install from source per [Development](#development) |
 
