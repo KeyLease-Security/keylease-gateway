@@ -2,6 +2,9 @@
 node_modules/
 .pnpm-store/
 
+# This is a pnpm workspace; a stray npm lockfile must not creep back in.
+package-lock.json
+
 # Build output
 dist/
 build/
