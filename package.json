@@ -15,7 +15,10 @@
     "lint": "eslint .",
     "test": "pnpm -r test",
     "test:watch": "pnpm -r --parallel test:watch",
-    "clean": "pnpm -r exec rm -rf dist coverage *.tsbuildinfo"
+    "clean": "pnpm -r exec rm -rf dist coverage *.tsbuildinfo",
+    "contract:build": "cd contracts/keylease-core && stellar contract build",
+    "contract:test": "cd contracts/keylease-core && cargo test",
+    "deploy:testnet": "node packages/cli/scripts/deploy-testnet.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

@@ -45,7 +45,7 @@ jobs:
       - name: Test
         run: pnpm test
 
-      - name: Upload coverage on failure
+      - name: Upload test output on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -55,3 +55,45 @@ jobs:
             packages/*/dist
           if-no-files-found: ignore
           retention-days: 7
+
+  contract:
+    name: contract · test · wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (wasm32v1-none)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/keylease-core
+
+      # soroban-sdk 29 requires stellar-cli to produce a deployable wasm
+      - name: Install stellar-cli
+        run: |
+          curl -sSL \
+            https://github.com/stellar/stellar-cli/releases/download/v28.1.0/stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz \
+            -o /tmp/stellar-cli.tar.gz
+          tar -xzf /tmp/stellar-cli.tar.gz -C /usr/local/bin stellar
+          stellar --version
+
+      - name: Contract unit tests
+        run: cargo test --manifest-path contracts/keylease-core/Cargo.toml
+
+      - name: Build contract wasm
+        run: cd contracts/keylease-core && stellar contract build
+
+      - name: Upload contract wasm
+        uses: actions/upload-artifact@v4
+        with:
+          name: keylease-core-wasm
+          path: contracts/keylease-core/target/wasm32v1-none/release/keylease_core.wasm
+          if-no-files-found: error
+          retention-days: 30

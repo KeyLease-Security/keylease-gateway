@@ -10,6 +10,14 @@ import {
   type EnvDeps,
 } from './commands/lease.js';
 import { statusCommand, type StatusArgs, type StatusDeps } from './commands/status.js';
+import {
+  revokeCommand,
+  settleCommand,
+  type RevokeArgs,
+  type RevokeDeps,
+  type SettleArgs,
+  type SettleDeps,
+} from './commands/lifecycle.js';
 
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
@@ -31,19 +39,23 @@ export class CliError extends Error {
   }
 }
 
-export type CommandName = 'acquire' | 'env' | 'status';
+export type CommandName = 'acquire' | 'env' | 'status' | 'settle' | 'revoke';
 
 export type Invocation =
   | { command: 'help' }
   | { command: 'version' }
   | { command: 'acquire'; args: AcquireArgs }
   | { command: 'env'; args: EnvArgs }
-  | { command: 'status'; args: StatusArgs };
+  | { command: 'status'; args: StatusArgs }
+  | { command: 'settle'; args: SettleArgs }
+  | { command: 'revoke'; args: RevokeArgs };
 
 export interface RunDeps {
   acquire?: AcquireDeps;
   env?: EnvDeps;
   status?: StatusDeps;
+  settle?: SettleDeps;
+  revoke?: RevokeDeps;
 }
 
 const OPTION_SPEC = {
@@ -184,9 +196,33 @@ export function parseArgv(argv: string[]): Invocation {
       }
       return { command: 'status', args };
     }
+    case 'settle': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'settle',
+        args: {
+          ...networkArgs(values),
+          lease: requireString(values, 'lease'),
+          secret: requireString(values, 'secret'),
+          json: values.json === true,
+        },
+      };
+    }
+    case 'revoke': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'revoke',
+        args: {
+          ...networkArgs(values),
+          lease: requireString(values, 'lease'),
+          secret: requireString(values, 'secret'),
+          json: values.json === true,
+        },
+      };
+    }
     default:
       throw new CliError(
-        `unknown command "${rawCommand}" (expected acquire, env or status)`,
+        `unknown command "${rawCommand}" (expected acquire, env, status, settle or revoke)`,
         'unknown_command',
       );
   }
@@ -199,19 +235,23 @@ Usage:
   ${CLI_NAME} acquire --service <id> --calls <count> --duration <secs> --secret <key>
   ${CLI_NAME} env     --service <id> [--file <path>]
   ${CLI_NAME} status  --lease <id> | --token <session-token>
+  ${CLI_NAME} settle  --lease <id> --secret <key>
+  ${CLI_NAME} revoke  --lease <id> --secret <key>
   ${CLI_NAME} help | --version
 
 Commands:
-  acquire   Invoke create_lease on keylease-core and mint a session bearer token
+  acquire   Prepay a lease in keylease-core escrow and mint a session bearer token
   env       Write the temporary session keys of an acquired lease into a local .env
   status    Inspect an on-chain lease, or verify a session token offline
+  settle    Settle an expired/exhausted lease: pay the provider, refund the consumer
+  revoke    End a lease early and refund its unused calls
 
 Options:
   --service <id>       Service identifier the lease is scoped to (required)
   --calls <count>      Number of API calls the lease authorises
   --duration <secs>    Lease lifetime in seconds
   --secret <key>       Stellar secret seed (S...) of the consumer account
-  --lease <id>         Lease id to inspect
+  --lease <id>         On-chain lease id (decimal u64)
   --token <token>      Session bearer token to verify offline
   --file <path>        Target env file for "env" (default: .env)
   --network <name>     testnet | mainnet | local (default: testnet)
@@ -263,6 +303,10 @@ export async function run(
         return await envCommand(invocation.args, io, deps.env);
       case 'status':
         return await statusCommand(invocation.args, io, deps.status);
+      case 'settle':
+        return await settleCommand(invocation.args, io, deps.settle);
+      case 'revoke':
+        return await revokeCommand(invocation.args, io, deps.revoke);
     }
   } catch (error) {
     if (error instanceof CliError) {

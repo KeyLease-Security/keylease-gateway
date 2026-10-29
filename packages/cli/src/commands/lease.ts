@@ -123,10 +123,9 @@ function renderAcquireOutput(session: LeaseSession, io: CliIo, json: boolean): v
     return;
   }
 
-  io.out(`Lease acquired for service "${session.service}"`);
-  io.out(`  lease id   : ${session.leaseId}`);
+  io.out(`Lease ${session.leaseId} acquired for service "${session.service}"`);
   io.out(`  consumer   : ${session.consumer}`);
-  io.out(`  calls      : ${session.callsLimit}`);
+  io.out(`  calls      : ${session.callsLimit} (prepaid into contract escrow)`);
   io.out(`  expires at : ${new Date(session.expiresAt * 1000).toISOString()}`);
   if (session.txHash) io.out(`  tx hash    : ${session.txHash}`);
   io.out('');

@@ -23,16 +23,19 @@ In scope:
 
 - session token forgery, replay or expiry bypass (`kls1.*` bearer tokens)
 - quota bypass or lease-verification bypass in the proxy
+- escrow bugs in `contracts/keylease-core`: paying a provider twice, releasing
+  more than `price_paid`, settling an active lease, refunding a revoked lease
+- authorisation gaps: `use_call` without the gateway, `revoke` without the
+  consumer, service mutation without its provider, `init` replay
 - Soroban RPC response spoofing / cache poisoning
 - secret leakage (Stellar secret seeds, session tokens) in CLI output, logs or files
 - header injection or request smuggling through the reverse proxy
 
 Out of scope:
 
-- vulnerabilities in the upstream `keylease-core` contract (report them on
-  [keylease-core](https://github.com/KeyLease-Security/keylease-core))
 - issues in third-party dependencies with an existing upstream fix
 - denial of service against the Soroban RPC endpoint itself
+- testnet-only operational issues (friendbot rate limits, unfunded demo keys)
 
 ## Audit status
 

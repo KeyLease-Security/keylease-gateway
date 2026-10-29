@@ -12,11 +12,14 @@ function leaseState(overrides: Partial<LeaseState> = {}): LeaseState {
   return {
     leaseId: 'lease-1',
     service: 'weather-api',
+    provider: 'GCCJ6YI4KDNQJWVXQY2QZ6XKQ2J6QJ6YI4KDNQJWVXQY2QZ6XKQ2J6Q',
     consumer: consumer.publicKey(),
     callsLimit: 5,
     callsUsed: 0,
     expiresAt: START + 3_600,
     active: true,
+    settled: false,
+    pricePaid: 5_000,
     ...overrides,
   };
 }
@@ -227,6 +230,45 @@ describe('LeaseVerifier local call counter', () => {
 
     verifier.resetCalls();
     expect(verifier.stats().counters).toBe(0);
+  });
+});
+
+describe('LeaseVerifier on-chain quota sink', () => {
+  it('records each served call so it can be committed on chain', async () => {
+    const recorded: string[] = [];
+    const provider: LeaseStateProvider = { getLeaseState: vi.fn(async () => leaseState()) };
+    const verifier = new LeaseVerifier({
+      provider,
+      clock: () => START * 1_000,
+      quotaSink: {
+        record: (leaseId: string) => recorded.push(leaseId),
+        flush: async () => {},
+        close: async () => {},
+        pendingFor: () => 0,
+      },
+    });
+
+    await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+
+    expect(recorded).toEqual(['lease-1', 'lease-1']);
+  });
+
+  it('does not record denied requests', async () => {
+    const record = vi.fn();
+    const verifier = new LeaseVerifier({
+      provider: {
+        getLeaseState: async () => {
+          throw new Error('rpc down');
+        },
+      },
+      clock: () => START * 1_000,
+      quotaSink: { record, flush: async () => {}, close: async () => {}, pendingFor: () => 0 },
+    });
+
+    const result = await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(result.ok).toBe(false);
+    expect(record).not.toHaveBeenCalled();
   });
 });
 

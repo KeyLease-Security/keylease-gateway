@@ -30,14 +30,17 @@ function renderState(state: LeaseState, io: CliIo, json: boolean): void {
   const expired = state.expiresAt <= Math.floor(Date.now() / 1000);
   io.out(`Lease ${state.leaseId}`);
   io.out(`  service    : ${state.service}`);
+  io.out(`  provider   : ${state.provider}`);
   io.out(`  consumer   : ${state.consumer}`);
   io.out(`  calls      : ${state.callsUsed}/${state.callsLimit}`);
+  io.out(`  escrow     : ${state.pricePaid} (paid into keylease-core)`);
   io.out(`  expires at : ${new Date(state.expiresAt * 1000).toISOString()}${expired ? ' (expired)' : ''}`);
   io.out(`  active     : ${state.active ? 'yes' : 'no'}`);
+  io.out(`  settled    : ${state.settled ? 'yes' : 'no'}`);
 }
 
 /**
- * `keylease status --lease <id>`        → reads live state over Soroban RPC
+ * `keylease status --lease <id>`        → reads live state from Soroban RPC
  * `keylease status --token <token>`     → verifies a session token offline
  */
 export async function statusCommand(

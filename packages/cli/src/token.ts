@@ -52,8 +52,8 @@ export class TokenVerificationError extends Error {
 const B64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 const DEFAULT_CLOCK_SKEW_SECONDS = 60;
 
-function encodeSegment(value: string | Buffer): string {
-  const buf = typeof value === 'string' ? Buffer.from(value, 'utf8') : value;
+function encodeSegment(value: string | Uint8Array): string {
+  const buf = typeof value === 'string' ? Buffer.from(value, 'utf8') : Buffer.from(value);
   return buf.toString('base64url');
 }
 

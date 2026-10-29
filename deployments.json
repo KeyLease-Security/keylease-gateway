@@ -1,0 +1,43 @@
+{
+  "network": "testnet",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "rpcUrl": "https://soroban-testnet.stellar.org",
+  "contractId": "CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC",
+  "wasmHash": "b8c0874e05e61a49e5ea2ac9961289946f14260cc036fb34930440c0bc1a30bd",
+  "wasmBytes": 13836,
+  "deployedAt": "2026-10-29T22:12:10.523Z",
+  "escrowToken": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "accounts": {
+    "admin": "GAVJ74TDCV5EUG3TQEBUBQLIFPY7WUM6TRVJMH5VMEB5CCYZTHDHSXGE",
+    "gateway": "GB3I3GNA7NFA5P3E5CCAVYBJPK2NRFOHEONLMEYRSWF4GV4RWE2M5AMS",
+    "provider": "GAUIGCCQ6NQEFP3V3NYVIATPS4DPKAKXHXLG53DPBS3JFJM3BOEPGOMG",
+    "consumer": "GBB7TYHBMYCA3UPBVH4GU4IONA4JFDAVDIG2V64MC52PPS3INPXP3OXX"
+  },
+  "transactions": {
+    "upload": "327114239efac079e49f140014020135829f2c150ad9c9dbf07fdf449613dc47",
+    "create": "1b94fb4522214f11b1548a54b921af9435b4cb9690474d8d4552c1cb669c6f7f",
+    "init": "f5ed865b9cebd467f5af645148cca3eae73ad3e11869a63a90bfb92bd4a26c08",
+    "registerService": "5d934e16163a52122731ae40b315bb08b4430bc8bd12280f6655c9d1229d54ee"
+  },
+  "services": [
+    {
+      "id": "weather-api",
+      "pricePerCall": 1000
+    }
+  ],
+  "demoLease": {
+    "leaseId": "1",
+    "calls": 25,
+    "duration": 86400,
+    "txHash": "8aea8f39f4d75adfa76416e2e98b03644acddaf4be449cc145f5253ba29d3db3"
+  },
+  "verification": {
+    "checkedAt": "2026-10-29T22:19:30.000Z",
+    "leaseId": "2",
+    "createLeaseTx": "8a31154bc07776a68585f3a1978eee6b8f9aea94653e1df7ad9d5839514302b9",
+    "escrowPaid": 2000,
+    "proxyRequest": { "status": 200, "callsRemaining": 1 },
+    "forgedTokenStatus": 401,
+    "onChainCallsUsedAfterCommit": 1
+  }
+}

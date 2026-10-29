@@ -12,6 +12,7 @@
 import { TokenVerificationError, verifySessionToken, type SessionTokenPayload } from '@keylease/cli/token';
 import type { LeaseState } from '@keylease/cli/soroban';
 import { DEFAULT_TTL_MS, TtlCache } from './cache.js';
+import type { QuotaSink } from './quota.js';
 
 export interface LeaseStateProvider {
   getLeaseState(leaseId: string): Promise<LeaseState>;
@@ -54,6 +55,11 @@ export interface VerifierOptions {
   clock?: () => number;
   /** Cap on tracked local counters. Defaults to 10 000. */
   maxCounters?: number;
+  /**
+   * Optional on-chain quota sink. When present, every served call is queued
+   * for a `use_call` commit so `calls_used` on chain tracks real traffic.
+   */
+  quotaSink?: QuotaSink;
 }
 
 export interface VerifierStats {
@@ -81,6 +87,7 @@ export class LeaseVerifier {
   private readonly cache: TtlCache<LeaseState>;
   private readonly clock: () => number;
   private readonly maxCounters: number;
+  private readonly quotaSink: QuotaSink | undefined;
   private readonly calls = new Map<string, number>();
   private rpcCalls = 0;
 
@@ -95,6 +102,7 @@ export class LeaseVerifier {
       });
     this.clock = options.clock ?? Date.now;
     this.maxCounters = options.maxCounters ?? 10_000;
+    this.quotaSink = options.quotaSink;
   }
 
   /**
@@ -192,6 +200,7 @@ export class LeaseVerifier {
     }
 
     this.consume(lease.leaseId, used + 1);
+    this.quotaSink?.record(lease.leaseId);
     return { ok: true, lease, payload, remainingCalls: limit - used - 1 };
   }
 

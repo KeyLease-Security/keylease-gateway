@@ -16,11 +16,14 @@ function leaseState(overrides: Partial<LeaseState> = {}): LeaseState {
   return {
     leaseId: 'lease-1',
     service: 'weather-api',
+    provider: 'GCCJ6YI4KDNQJWVXQY2QZ6XKQ2J6QJ6YI4KDNQJWVXQY2QZ6XKQ2J6Q',
     consumer: consumer.publicKey(),
     callsLimit: 10,
     callsUsed: 0,
     expiresAt: NOW + 3_600,
     active: true,
+    settled: false,
+    pricePaid: 10_000,
     ...overrides,
   };
 }

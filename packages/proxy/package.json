@@ -25,10 +25,10 @@
   },
   "dependencies": {
     "@keylease/cli": "workspace:*",
+    "@stellar/stellar-sdk": "^17.4.0",
     "fastify": "^5.6.0"
   },
   "devDependencies": {
-    "@stellar/stellar-sdk": "^13.3.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0",
     "vitest": "^3.0.0"
