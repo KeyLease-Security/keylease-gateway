@@ -190,6 +190,10 @@ friendbot, writes `deployments.json` (public) and
 Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
 `--contract <id>`, `--json` (machine-readable output).
 
+Lease ids (`--lease <id>`) are canonical unsigned decimals: digits `1`–`9`
+followed by any digits, with no leading zeros (e.g. `7`, valid; `007`, rejected).
+Zero and values above `18446744073709551615` (u64) are rejected.
+
 `--secret` is the consumer account's **Stellar secret seed**. It signs the
 `create_lease` transaction and the session token, and it never leaves the
 process — it is not printed, logged, or written to disk.

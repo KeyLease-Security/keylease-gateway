@@ -294,7 +294,9 @@ export function encodeLeaseState(state: LeaseState): xdr.ScVal {
 
 /** Validates the decimal `u64` lease id used on chain and in bearer tokens. */
 export function parseLeaseId(leaseId: string): bigint {
-  if (!/^[0-9]+$/.test(leaseId)) {
+  // Canonical decimal form only: no leading zeros, so each id has exactly one
+  // string spelling. Zero itself is rejected by the range check below.
+  if (!/^(?:0|[1-9][0-9]*)$/.test(leaseId)) {
     throw new SorobanError(`lease id "${leaseId}" must be a decimal u64`);
   }
   const value = BigInt(leaseId);

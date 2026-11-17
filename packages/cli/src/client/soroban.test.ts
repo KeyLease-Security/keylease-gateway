@@ -37,6 +37,18 @@ describe('parseLeaseId', () => {
     expect(() => parseLeaseId('0')).toThrow(/out of the u64 range/);
     expect(() => parseLeaseId('18446744073709551616')).toThrow(/out of the u64 range/);
   });
+
+  it('rejects leading zeros (non-canonical decimal)', () => {
+    expect(() => parseLeaseId('00')).toThrow(/decimal u64/);
+    expect(() => parseLeaseId('007')).toThrow(/decimal u64/);
+    expect(() => parseLeaseId('01')).toThrow(/decimal u64/);
+  });
+
+  it('accepts the canonical maximum and single-digit ids', () => {
+    expect(parseLeaseId('1')).toBe(1n);
+    expect(parseLeaseId('9')).toBe(9n);
+    expect(parseLeaseId('18446744073709551615')).toBe(0xffff_ffff_ffff_ffffn);
+  });
 });
 
 describe('parseLeaseState', () => {
