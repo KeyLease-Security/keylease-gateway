@@ -107,7 +107,8 @@ sequenceDiagram
 - **Quota is enforced on chain, not just in memory.** A proxy's local counter
   is only a fast path; running a second proxy would otherwise mint free quota.
   The gateway account commits served calls with `use_call`, so `calls_used` on
-  chain reflects real traffic and every instance sees the same remaining quota.
+  chain reflects real traffic and every instance sees the same remaining quota. Commits are batched, so a killed proxy can under-report
+  usage; see [docs/quota-batching.md](./docs/quota-batching.md).
 - **The signature check is offline.** A bearer token is
   `kls1.<base64url(payload)>.<ed25519 signature>` where the payload carries
   `(v, lease_id, consumer, iat, exp)` and the signature is produced by the
