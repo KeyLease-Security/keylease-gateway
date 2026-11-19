@@ -312,10 +312,16 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `KEYLEASE_NETWORK` | no | `testnet` | `testnet` \| `mainnet` \| `local` |
 | `KEYLEASE_RPC_URL` | no | network default | Soroban RPC endpoint override |
 | `KEYLEASE_GATEWAY_SECRET` | no | – | Seed of the registered gateway; enables on-chain `use_call` commits. Omit to enforce quota locally only |
-| `KEYLEASE_QUOTA_BATCH` | no | `50` | Buffered calls before committing on chain |
-| `KEYLEASE_QUOTA_FLUSH_MS` | no | `10000` | Periodic quota commit interval |
-| `KEYLEASE_CACHE_TTL_MS` | no | `30000` | Lease-state cache TTL |
+| `KEYLEASE_QUOTA_BATCH` | no | `50` | Buffered calls before committing on chain (accepted range: `1`–`10000`) |
+| `KEYLEASE_QUOTA_FLUSH_MS` | no | `10000` | Periodic quota commit interval in milliseconds (accepted range: `1`–`300000`, i.e. at most 5 minutes) |
+| `KEYLEASE_CACHE_TTL_MS` | no | `30000` | Lease-state cache TTL in milliseconds. Accepted range: `1`–`300000`; values above 5 minutes are rejected at startup because they would silently weaken expiry enforcement |
 | `KEYLEASE_MAX_BODY_BYTES` | no | `33554432` (32 MiB) | Maximum allowed request body size in bytes |
+| `KEYLEASE_KEEP_ALIVE_TIMEOUT_MS` | no | `72000` | Inbound socket keep-alive window in milliseconds; short windows resist slowloris-style connection holding. Accepted range: `1`–`3600000` |
+| `KEYLEASE_REQUEST_TIMEOUT_MS` | no | `300000` | Deadline for receiving an entire inbound request, in milliseconds. An expired request is answered with `408 request_timeout` JSON. Accepted range: `1`–`3600000` |
+| `KEYLEASE_CORS_ALLOWED_ORIGINS` | no | `*` | Comma-separated origins allowed by CORS, or `*` to allow any origin. A wildcard cannot be combined with credentials |
+| `KEYLEASE_CORS_ALLOWED_HEADERS` | no | `authorization,content-type,x-request-id` | Comma-separated request header names echoed by preflight responses. Use `*` to echo the requested headers on non-credentialed requests |
+| `KEYLEASE_CORS_ALLOW_CREDENTIALS` | no | `false` | `true` to send `Access-Control-Allow-Credentials: true`; requires explicit `KEYLEASE_CORS_ALLOWED_ORIGINS` |
+| `KEYLEASE_CORS_MAX_AGE_SECONDS` | no | `600` | `Access-Control-Max-Age` for preflight responses; accepted range `0`–`86400` |
 | `KEYLEASE_TRUST_PROXY` | no | `false` | Trusted edge proxies for `x-forwarded-*`: `true`, a hop count, or a comma-separated IP/CIDR list. When off, inbound `x-forwarded-*` headers are dropped and rebuilt from the socket |
 | `KEYLEASE_MAX_INFLIGHT` | no | `1024` | Maximum concurrent proxied requests. Excess requests get `503` with `Retry-After: 1` before any quota is charged; `0` disables the cap |
 | `KEYLEASE_FORWARD_AUTH` | no | `false` | Forward the caller's bearer token upstream |
@@ -330,6 +336,8 @@ The on-chain quota sink tracks at most 10,000 distinct leases in its pending bat
 | Status | Meaning |
 | --- | --- |
 | `200` | Health check (`/healthz`) or readiness probe (`/readyz`) |
+| `204` | CORS preflight (`OPTIONS` with `Access-Control-Request-Method`). Answered before verification: no token is read and no quota is charged |
+| `408 request_timeout` | The inbound request was not fully received within `KEYLEASE_REQUEST_TIMEOUT_MS` |
 | `401 missing_token` / `invalid_token` / `token_expired` | Bearer token absent, malformed, forged or expired |
 | `403 lease_not_found` / `lease_inactive` / `lease_expired` / `consumer_mismatch` | On-chain lease does not permit this call |
 | `403 quota_exhausted` | The lease's call limit has been spent (on chain, locally, or both) |
@@ -342,6 +350,8 @@ Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
 Forwarded upstream requests also receive these headers set exclusively by the proxy; any client-supplied `x-keylease-*` headers are stripped to prevent spoofing.
 Once lease verification succeeds, the call remains consumed even if the client disconnects or the upstream request fails; aborted calls are not refunded.
 `/healthz` and `/readyz` endpoints provide health and readiness probes without requiring bearer tokens and are never forwarded upstream.
+CORS preflight requests are answered before verification with `204`, an `Access-Control-Allow-Methods` list and the configured `Access-Control-Allow-Headers`/`Access-Control-Allow-Origin` allowlists; browser responses also expose `x-request-id`, `x-keylease-lease-id` and `x-keylease-calls-remaining`. A plain `OPTIONS` request without `Access-Control-Request-Method` is not a preflight and still requires a lease token.
+Multi-valued upstream response headers such as `vary`, `link` and `warning` are combined with `, ` rather than overwritten; multiple `set-cookie` values keep one field line each.
 
 ---
 

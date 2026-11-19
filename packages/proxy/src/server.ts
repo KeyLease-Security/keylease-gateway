@@ -4,7 +4,13 @@
  * allowed requests to the protected upstream API.
  */
 import { randomUUID } from 'node:crypto';
-import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import type { Socket } from 'node:net';
+import Fastify, {
+  type ConnectionError,
+  type FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+} from 'fastify';
 import type { LeaseVerifier } from './verifier.js';
 
 /** Headers defined by RFC 9110 that must never be forwarded verbatim. */
@@ -20,6 +26,58 @@ export const HOP_BY_HOP_HEADERS: ReadonlySet<string> = new Set([
   'host',
   'content-length',
 ]);
+
+/** Browser CORS policy applied to preflight and forwarded responses. */
+export interface CorsOptions {
+  /**
+   * Origins allowed to read responses. `*` allows any origin, but cannot be
+   * combined with `allowCredentials`. Defaults to `["*"]`.
+   */
+  allowedOrigins?: string[];
+  /**
+   * Request header names echoed by preflight responses. Lowercase tokens, or
+   * `*` to echo whatever the browser asked for (non-credentialed requests
+   * only). Defaults to Authorization, Content-Type and X-Request-Id.
+   */
+  allowedHeaders?: string[];
+  /** Methods advertised by preflight responses. Defaults to the routed methods. */
+  allowedMethods?: string[];
+  /** Send `Access-Control-Allow-Credentials: true`. Requires explicit origins. */
+  allowCredentials?: boolean;
+  /** `Access-Control-Max-Age` in seconds. Defaults to 600. */
+  maxAgeSeconds?: number;
+}
+
+export interface ResolvedCorsOptions {
+  allowedOrigins: string[];
+  allowedHeaders: string[];
+  allowedMethods: string[];
+  allowCredentials: boolean;
+  maxAgeSeconds: number;
+}
+
+export const DEFAULT_CORS_ALLOWED_HEADERS: readonly string[] = [
+  'authorization',
+  'content-type',
+  'x-request-id',
+];
+export const DEFAULT_CORS_ALLOWED_METHODS: readonly string[] = [
+  'GET',
+  'HEAD',
+  'POST',
+  'PUT',
+  'PATCH',
+  'DELETE',
+  'OPTIONS',
+];
+export const DEFAULT_CORS_MAX_AGE_SECONDS = 600;
+
+/** Custom headers the browser is allowed to read from proxy responses. */
+export const CORS_EXPOSED_HEADERS: readonly string[] = [
+  'x-request-id',
+  'x-keylease-lease-id',
+  'x-keylease-calls-remaining',
+];
 
 export interface ProxyOptions {
   /** Base URL of the protected API, e.g. `https://api.example.com`. */
@@ -49,6 +107,19 @@ export interface ProxyOptions {
    * `Retry-After`. Defaults to 1024; 0 disables the cap.
    */
   maxInFlight?: number;
+  /**
+   * Idle keep-alive window for inbound sockets in milliseconds. Passed to
+   * Fastify's `keepAliveTimeout`. When omitted, Fastify's default applies.
+   */
+  keepAliveTimeoutMs?: number;
+  /**
+   * Deadline for receiving an entire inbound request, in milliseconds. Passed
+   * to Fastify's `requestTimeout`; an expired request gets a `408` with a JSON
+   * `request_timeout` body. When omitted, Fastify/Node's default applies.
+   */
+  incomingRequestTimeoutMs?: number;
+  /** CORS policy for browser clients. */
+  cors?: CorsOptions;
 }
 
 export const DEFAULT_MAX_IN_FLIGHT = 1024;
@@ -119,18 +190,188 @@ function allowsBody(method: string): boolean {
   return method !== 'GET' && method !== 'HEAD';
 }
 
-function copyResponseHeaders(reply: FastifyReply, headers: Headers): void {
+/**
+ * Copies upstream response headers onto the Fastify reply.
+ *
+ * Repeated field names are accumulated rather than overwritten: Fetch folds
+ * duplicates into a single comma-joined value for most names, but not every
+ * runtime does, and a second `vary`, `link` or `warning` field must survive the
+ * proxy (RFC 9110 §5.3 allows combining them with `, `). `set-cookie` is the
+ * exception — it is never folded, so it keeps using `getSetCookie()` and each
+ * cookie stays on its own field line.
+ */
+export function copyResponseHeaders(reply: FastifyReply, headers: Headers): void {
+  const accumulated = new Map<string, string[]>();
   const setCookies = typeof headers.getSetCookie === 'function' ? headers.getSetCookie() : [];
   for (const [key, value] of headers) {
     const lower = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
     if (lower === 'set-cookie') continue;
-    if (lower === 'content-type' && value === undefined) continue;
-    reply.header(lower, value);
+    if (value === undefined) continue;
+    const values = accumulated.get(lower);
+    if (values === undefined) {
+      accumulated.set(lower, [value]);
+    } else {
+      values.push(value);
+    }
+  }
+  for (const [key, values] of accumulated) {
+    reply.header(key, values.length === 1 ? values[0]! : values.join(', '));
   }
   for (const cookie of setCookies) {
     reply.header('set-cookie', cookie);
   }
+}
+
+/** True for browser CORS preflight: `OPTIONS` plus `Access-Control-Request-Method`. */
+export function isCorsPreflight(
+  request: Pick<FastifyRequest, 'method' | 'headers'>,
+): boolean {
+  if (request.method !== 'OPTIONS') return false;
+  const requestedMethod = request.headers['access-control-request-method'];
+  return typeof requestedMethod === 'string' && requestedMethod.trim().length > 0;
+}
+
+function normalizeCors(cors: CorsOptions | undefined): ResolvedCorsOptions {
+  const allowedOrigins = cors?.allowedOrigins?.length ? cors.allowedOrigins : ['*'];
+  const allowCredentials = cors?.allowCredentials === true;
+  if (allowCredentials && allowedOrigins.includes('*')) {
+    throw new Error(
+      'CORS allowCredentials cannot be combined with a wildcard origin; list explicit origins instead',
+    );
+  }
+  return {
+    allowedOrigins,
+    allowedHeaders: cors?.allowedHeaders?.length
+      ? cors.allowedHeaders.map((header) => header.toLowerCase())
+      : [...DEFAULT_CORS_ALLOWED_HEADERS],
+    allowedMethods: cors?.allowedMethods?.length
+      ? cors.allowedMethods.map((method) => method.toUpperCase())
+      : [...DEFAULT_CORS_ALLOWED_METHODS],
+    allowCredentials,
+    maxAgeSeconds: cors?.maxAgeSeconds ?? DEFAULT_CORS_MAX_AGE_SECONDS,
+  };
+}
+
+/** Returns the `Access-Control-Allow-Origin` value for this origin, if any. */
+function allowedCorsOrigin(
+  origin: string | undefined,
+  cors: ResolvedCorsOptions,
+): string | undefined {
+  if (origin === undefined || origin === '') return undefined;
+  if (cors.allowedOrigins.includes('*') && !cors.allowCredentials) return '*';
+  return cors.allowedOrigins.includes(origin) ? origin : undefined;
+}
+
+function appendVary(reply: FastifyReply, value: string): void {
+  const current = reply.getHeader('vary');
+  const values =
+    current === undefined
+      ? []
+      : (Array.isArray(current) ? current : [current]).flatMap((entry) =>
+          String(entry)
+            .split(',')
+            .map((part) => part.trim())
+            .filter((part) => part.length > 0),
+        );
+  if (!values.some((entry) => entry.toLowerCase() === value.toLowerCase())) {
+    values.push(value);
+  }
+  reply.header('vary', values.join(', '));
+}
+
+/** Applies the configured CORS response headers for a browser request. */
+function applyCorsHeaders(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  cors: ResolvedCorsOptions,
+): void {
+  const origin = request.headers.origin;
+  if (typeof origin !== 'string') return;
+  const allowed = allowedCorsOrigin(origin, cors);
+  if (allowed === undefined) return;
+  reply.header('access-control-allow-origin', allowed);
+  if (allowed !== '*') appendVary(reply, 'Origin');
+  if (cors.allowCredentials) {
+    reply.header('access-control-allow-credentials', 'true');
+  }
+  reply.header('access-control-expose-headers', CORS_EXPOSED_HEADERS.join(', '));
+}
+
+/** Answers a preflight without touching the verifier, quota or upstream. */
+function answerPreflight(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  cors: ResolvedCorsOptions,
+): FastifyReply {
+  applyCorsHeaders(request, reply, cors);
+  reply.header('access-control-allow-methods', cors.allowedMethods.join(', '));
+
+  const requested = request.headers['access-control-request-headers'];
+  const requestedHeaders =
+    typeof requested === 'string'
+      ? requested
+          .split(',')
+          .map((header) => header.trim().toLowerCase())
+          .filter((header) => header.length > 0)
+      : [];
+  if (cors.allowedHeaders.includes('*') && !cors.allowCredentials) {
+    reply.header(
+      'access-control-allow-headers',
+      requestedHeaders.length > 0 ? requestedHeaders.join(', ') : '*',
+    );
+  } else {
+    reply.header('access-control-allow-headers', cors.allowedHeaders.join(', '));
+  }
+  reply.header('access-control-max-age', String(cors.maxAgeSeconds));
+  reply.header(REQUEST_ID_HEADER, request.id);
+  return reply.code(204).send();
+}
+
+function writeJsonClientError(
+  socket: Socket,
+  status: number,
+  reason: string,
+  body: Record<string, unknown>,
+): void {
+  if (!socket.writable) return;
+  const payload = JSON.stringify(body);
+  socket.write(
+    `HTTP/1.1 ${status} ${reason}\r\nContent-Length: ${Buffer.byteLength(payload)}\r\n` +
+      `Content-Type: application/json; charset=utf-8\r\nConnection: close\r\n\r\n${payload}`,
+  );
+}
+
+/**
+ * Fastify client-error handler. It mirrors Fastify's defaults but gives an
+ * inbound request timeout a JSON `408 request_timeout` body instead of the
+ * generic "Client Timeout" payload.
+ */
+export function proxyClientErrorHandler(error: ConnectionError, socket: Socket): void {
+  if (error.code === 'ECONNRESET' || socket.destroyed) return;
+  if (error.code === 'ERR_HTTP_REQUEST_TIMEOUT') {
+    writeJsonClientError(socket, 408, 'Request Timeout', {
+      error: 'request_timeout',
+      message: 'request did not complete within the configured timeout',
+    });
+    socket.destroy(error);
+    return;
+  }
+  if (error.code === 'HPE_HEADER_OVERFLOW') {
+    writeJsonClientError(socket, 431, 'Request Header Fields Too Large', {
+      error: 'Request Header Fields Too Large',
+      message: 'Exceeded maximum allowed HTTP header size',
+      statusCode: 431,
+    });
+    socket.destroy(error);
+    return;
+  }
+  writeJsonClientError(socket, 400, 'Bad Request', {
+    error: 'Bad Request',
+    message: 'Client Error',
+    statusCode: 400,
+  });
+  socket.destroy(error);
 }
 
 /**
@@ -142,6 +383,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   const fetchImpl: typeof fetch = options.fetchImpl ?? globalThis.fetch;
   const forwardAuthorization = options.forwardAuthorization === true;
   const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
+  const cors = normalizeCors(options.cors);
   const verificationRetryAfterSeconds = Math.max(
     1,
     Math.ceil(Math.min(verifier.cacheTtlMs, 30_000) / 1_000),
@@ -156,6 +398,13 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
     trustProxy: (options.trustProxy ?? false) as boolean,
     requestIdHeader: false,
     genReqId: (req) => resolveRequestId(req.headers[REQUEST_ID_HEADER]),
+    clientErrorHandler: proxyClientErrorHandler,
+    ...(options.keepAliveTimeoutMs === undefined
+      ? {}
+      : { keepAliveTimeout: options.keepAliveTimeoutMs }),
+    ...(options.incomingRequestTimeoutMs === undefined
+      ? {}
+      : { requestTimeout: options.incomingRequestTimeoutMs }),
   });
   app.removeAllContentTypeParsers();
   app.addContentTypeParser('*', { parseAs: 'buffer' }, (_request, body, done) => {
@@ -171,6 +420,13 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   app.addHook('onRequest', async (request, reply) => {
     inFlightRequests += 1;
     reply.header(REQUEST_ID_HEADER, request.id);
+  });
+
+  app.addHook('onSend', async (request, reply, payload) => {
+    // Browser responses (including denials) must carry the configured CORS
+    // headers or the browser withholds the body from the caller.
+    applyCorsHeaders(request, reply, cors);
+    return payload;
   });
 
   app.addHook('onResponse', async (request, reply) => {
@@ -241,6 +497,11 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   });
   const handler = async (request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply> => {
     metrics.requestsTotal += 1;
+    // A preflight is unauthenticated by design: answer it before verification,
+    // in-flight accounting and quota, so no lease call is ever consumed.
+    if (isCorsPreflight(request)) {
+      return answerPreflight(request, reply, cors);
+    }
     if (maxInFlight > 0 && upstreamSlots >= maxInFlight) {
       return reply
         .code(503)
