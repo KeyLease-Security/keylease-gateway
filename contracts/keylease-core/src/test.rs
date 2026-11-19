@@ -359,6 +359,35 @@ fn revoke_refunds_unused_calls_immediately() {
 }
 
 #[test]
+fn revoke_expired_lease_fails_before_expiry() {
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &3_600);
+    let err = h.client.try_revoke_expired_lease(&id).unwrap_err();
+    assert_eq!(err.unwrap(), Error::LeaseNotSettleable);
+}
+
+#[test]
+fn revoke_expired_lease_succeeds_after_expiry_with_refund() {
+    let h = setup();
+    register(&h);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &3_600);
+    h.client.use_call(&id, &2);
+
+    h.env.ledger().with_mut(|li| li.timestamp = 3_601);
+
+    let before = balance(&h, &h.consumer);
+    let lease = h.client.revoke_expired_lease(&id);
+    assert_eq!(balance(&h, &h.consumer), before + 8_000);
+    assert!(lease.settled);
+    assert_eq!(h.client.remaining_calls(&id), 0);
+}
+
+#[test]
 fn set_service_active_requires_the_registered_provider() {
     let h = setup();
     register(&h);

@@ -21,8 +21,8 @@ Everything the system depends on is Soroban:
 | Layer | What it does on Stellar |
 | --- | --- |
 | [`contracts/keylease-core`](./contracts/keylease-core) | Soroban registry: services, prepaid leases, **escrow**, on-chain quota, provider payout + consumer refund |
-| [`@keylease/cli`](./packages/cli) | Signs `create_lease` (paying the SAC token) and mints ed25519 session tokens; `settle`/`revoke` release escrow |
-| [`@keylease/proxy`](./packages/proxy) | Verifies session tokens offline, reads lease state by **simulating** `get_lease`, and commits served calls with `use_call` |
+| [`@keylease/cli`](./packages/cli) | Signs `create_lease` (paying the SAC token) and mints ed25519 session tokens; `settle`/`revoke`/`release` release escrow |
+| [`@keylease/proxy`](./packages/proxy) | Verifies session tokens offline, reads lease state by **simulating** `get_lease`, streams responses, and commits served calls with `use_call` |
 
 ```
 contracts/keylease-core  →  Soroban contract (Rust, soroban-sdk 29)
@@ -233,6 +233,7 @@ friendbot, writes `deployments.json` (public) and
 | `keylease completions <shell>` | Prints a bash, zsh or fish completion script (`bash`, `zsh`, `fish`) |
 | `keylease settle --lease <id> --secret <key>` | Settles an expired/exhausted lease: provider payout + consumer refund |
 | `keylease revoke --lease <id> --secret <key>` | Ends a lease early and refunds its unused calls |
+| `keylease release --lease <id> --secret <key> [--json]` | Releases an expired lease to claim consumer refund |
 | `keylease help` · `keylease --version` | Help / version |
 
 Common flags: `--network testnet|mainnet|local`, `--rpc <url>`,
@@ -439,6 +440,7 @@ An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 | `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
 | `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
+| `revoke_expired_lease(lease_id)` | consumer | Refunds unused calls on expired leases |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
 | `version()` | – | Contract ABI version as a `String`, equal to the crate version in `Cargo.toml`; callable before `init` |

@@ -1,4 +1,15 @@
+import { timingSafeEqual } from 'node:crypto';
 import { Keypair, StrKey } from '@stellar/stellar-sdk';
+
+/**
+ * Constant-time string equality check to prevent timing side channels.
+ */
+export function timingSafeEqualString(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
 
 /**
  * Session bearer token format.
@@ -200,10 +211,16 @@ export function verifySessionToken(
     throw new TokenVerificationError('bad_signature', 'session token signature does not verify');
   }
 
-  if (options.expectedLeaseId !== undefined && payload.lease_id !== options.expectedLeaseId) {
+  if (
+    options.expectedLeaseId !== undefined &&
+    !timingSafeEqualString(payload.lease_id, options.expectedLeaseId)
+  ) {
     throw new TokenVerificationError('lease_mismatch', 'token is not scoped to the requested lease');
   }
-  if (options.expectedConsumer !== undefined && payload.consumer !== options.expectedConsumer) {
+  if (
+    options.expectedConsumer !== undefined &&
+    !timingSafeEqualString(payload.consumer, options.expectedConsumer)
+  ) {
     throw new TokenVerificationError('consumer_mismatch', 'token consumer does not match the lease consumer');
   }
 

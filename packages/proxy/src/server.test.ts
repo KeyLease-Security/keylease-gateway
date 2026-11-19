@@ -62,10 +62,18 @@ function stubFetch(
 }
 
 function okJson(body: unknown, init: ResponseInit = {}): Response {
-  return new Response(JSON.stringify(body), {
+  const json = JSON.stringify(body);
+  const headers = new Headers(init.headers);
+  if (!headers.has('content-type')) {
+    headers.set('content-type', 'application/json');
+  }
+  if (!headers.has('content-length')) {
+    headers.set('content-length', String(Buffer.byteLength(json)));
+  }
+  return new Response(json, {
     status: 200,
-    headers: { 'content-type': 'application/json' },
     ...init,
+    headers,
   });
 }
 
@@ -1271,9 +1279,214 @@ describe('buildUpstreamHeaders property test (request-smuggling vectors)', () =>
     }
   });
 
+  it('filters through allowedHeaders when configured', () => {
+    const out = buildUpstreamHeaders(
+      {
+        accept: 'text/html',
+        'x-custom': 'allowed',
+        'x-other': 'denied',
+        authorization: 'Bearer kls1.a.b',
+      },
+      { allowedHeaders: ['accept', 'x-custom'] },
+    );
+    expect(out).toEqual({
+      accept: 'text/html',
+      'x-custom': 'allowed',
+    });
+  });
+
   it('is deterministic for a given seed', () => {
     const a = prng(42);
     const b = prng(42);
     expect([a(), a(), a()]).toEqual([b(), b(), b()]);
+  });
+});
+
+describe('response streaming (issue #17)', () => {
+  it('streams multi-chunk upstream body while preserving headers and status', async () => {
+    const chunks = ['chunk-1 ', 'chunk-2 ', 'chunk-3'];
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(new TextEncoder().encode(chunk));
+        }
+        controller.close();
+      },
+    });
+
+    const response = new Response(stream, {
+      status: 200,
+      headers: {
+        'content-type': 'text/plain; charset=utf-8',
+        'x-upstream-header': 'custom-value',
+      },
+    });
+
+    const { impl } = stubFetch(async () => response);
+    const provider: LeaseStateProvider = { getLeaseState: vi.fn(async () => leaseState()) };
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier(provider),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/stream',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('text/plain; charset=utf-8');
+    expect(res.headers['x-upstream-header']).toBe('custom-value');
+    expect(res.body).toBe('chunk-1 chunk-2 chunk-3');
+    await app.close();
+  });
+
+  it('cancels upstream stream on client abort', async () => {
+    let cancelled = false;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('first-chunk '));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+
+    const response = new Response(stream, {
+      status: 200,
+      headers: { 'content-type': 'text/plain' },
+    });
+
+    const { impl } = stubFetch(async () => response);
+    const provider: LeaseStateProvider = { getLeaseState: vi.fn(async () => leaseState()) };
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier(provider),
+      fetchImpl: impl,
+    });
+
+    const address = await app.listen({ port: 0, host: '127.0.0.1' });
+
+    const req = httpRequest(address, {
+      path: '/v1/abort-test',
+      method: 'GET',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+
+    req.on('response', (res) => {
+      res.on('data', () => {
+        req.destroy();
+      });
+    });
+    req.on('error', () => {});
+    req.end();
+
+    try {
+      await vi.waitFor(() => expect(cancelled).toBe(true));
+    } finally {
+      req.destroy();
+      await app.close();
+    }
+  });
+});
+
+describe('security hardening and threat model (issue #3)', () => {
+  it('rejects tampered session token signature with 401 invalid_token', async () => {
+    const validToken = mintToken();
+    const parts = validToken.split('.');
+    expect(parts.length).toBe(3);
+    // Tamper signature
+    const tamperedSig = parts[2]!.replace(/[a-zA-Z0-9]/, (c) => (c === 'a' ? 'b' : 'a'));
+    const forgedToken = `${parts[0]}.${parts[1]}.${tamperedSig}`;
+
+    const { impl } = stubFetch(async () => okJson({ ok: true }));
+    const provider: LeaseStateProvider = { getLeaseState: vi.fn(async () => leaseState()) };
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier(provider),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/secret',
+      headers: { authorization: `Bearer ${forgedToken}` },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toMatchObject({ error: 'invalid_token' });
+    await app.close();
+  });
+
+  it('strips client-supplied mixed-case x-keylease-* and x-forwarded-* headers before upstream', async () => {
+    let capturedHeaders: Record<string, string> = {};
+    const { impl } = stubFetch(async (_url, init) => {
+      capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+      return okJson({ ok: true });
+    });
+
+    const provider: LeaseStateProvider = { getLeaseState: vi.fn(async () => leaseState()) };
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier(provider),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/headers',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        'X-KeyLease-Injected': 'malicious',
+        'x-keylease-spoof': 'fake',
+        'X-Forwarded-For': '1.2.3.4',
+        'X-Forwarded-Host': 'evil.com',
+        'x-custom-header': 'safe',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(capturedHeaders['x-keylease-injected']).toBeUndefined();
+    expect(capturedHeaders['x-keylease-spoof']).toBeUndefined();
+    // Valid proxy-generated headers exist
+    expect(capturedHeaders['x-keylease-lease-id']).toBe('lease-1');
+    expect(capturedHeaders['x-keylease-calls-remaining']).toBe('9');
+    expect(capturedHeaders['x-custom-header']).toBe('safe');
+    await app.close();
+  });
+
+  it('enforces header allowlist when specified in ProxyOptions', async () => {
+    let capturedHeaders: Record<string, string> = {};
+    const { impl } = stubFetch(async (_url, init) => {
+      capturedHeaders = (init?.headers as Record<string, string>) ?? {};
+      return okJson({ ok: true });
+    });
+
+    const provider: LeaseStateProvider = { getLeaseState: vi.fn(async () => leaseState()) };
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier(provider),
+      fetchImpl: impl,
+      allowedHeaders: ['accept', 'x-allowed'],
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/allowlist',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        accept: 'application/json',
+        'x-allowed': 'allowed-value',
+        'x-not-allowed': 'blocked-value',
+      },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(capturedHeaders['accept']).toBe('application/json');
+    expect(capturedHeaders['x-allowed']).toBe('allowed-value');
+    expect(capturedHeaders['x-not-allowed']).toBeUndefined();
+    await app.close();
   });
 });

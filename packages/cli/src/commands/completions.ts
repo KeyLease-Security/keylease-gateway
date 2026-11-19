@@ -82,6 +82,11 @@ export const COMPLETION_COMMANDS: readonly CompletionCommand[] = [
     flags: ['--lease', '--secret', '--network', '--rpc', '--contract', '--json', '--help'],
   },
   {
+    name: 'release',
+    summary: 'Release an expired lease to claim the consumer refund',
+    flags: ['--lease', '--secret', '--network', '--rpc', '--contract', '--json', '--help'],
+  },
+  {
     name: 'sessions',
     summary: 'List or prune locally stored leases',
     flags: ['--prune', '--json', '--help'],

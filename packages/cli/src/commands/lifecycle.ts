@@ -10,9 +10,15 @@
  * * `revoke` is consumer-authorised and returns the unused calls immediately.
  */
 import type { Keypair } from '@stellar/stellar-sdk';
-import { SorobanClient, type LeaseState } from '../client/soroban.js';
+import {
+  SorobanClient,
+  type LeaseState,
+  LeaseNotFoundError,
+  ContractCallError,
+} from '../client/soroban.js';
 import { parseConsumerSecret, type NetworkArgs } from './lease.js';
 import type { CliIo } from '../index.js';
+import { CliError } from '../errors.js';
 
 export interface SettleArgs extends NetworkArgs {
   lease: string;
@@ -26,12 +32,22 @@ export interface RevokeArgs extends NetworkArgs {
   json: boolean;
 }
 
+export interface ReleaseArgs extends NetworkArgs {
+  lease: string;
+  secret: string;
+  json: boolean;
+}
+
 export interface SettleDeps {
   createClient?: (args: SettleArgs) => Pick<SorobanClient, 'settle'>;
 }
 
 export interface RevokeDeps {
   createClient?: (args: RevokeArgs) => Pick<SorobanClient, 'revoke'>;
+}
+
+export interface ReleaseDeps {
+  createClient?: (args: ReleaseArgs) => Pick<SorobanClient, 'release'>;
 }
 
 function defaultClient(args: NetworkArgs): SorobanClient {
@@ -90,4 +106,71 @@ export async function revokeCommand(
   const lease = await client.revoke(args.lease, signer);
   renderLeaseOutcome('revoked', lease, io, args.json);
   return 0;
+}
+
+/** `keylease release --lease <id> --secret <key>` */
+export async function releaseCommand(
+  args: ReleaseArgs,
+  io: CliIo,
+  deps: ReleaseDeps = {},
+): Promise<number> {
+  let signer: Keypair;
+  try {
+    signer = parseConsumerSecret(args.secret);
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError('auth failure: invalid consumer secret', 'auth_failure');
+  }
+  const client = deps.createClient ? deps.createClient(args) : defaultClient(args);
+  try {
+    const result = await client.release(args.lease, signer);
+    if (args.json) {
+      io.out(
+        JSON.stringify(
+          { leaseId: result.leaseId, refunded: result.refunded, txHash: result.txHash },
+          null,
+          2,
+        ),
+      );
+      return 0;
+    }
+    io.out(`Lease ${result.leaseId} released`);
+    io.out(`  refunded : ${result.refunded}`);
+    io.out(`  txHash   : ${result.txHash}`);
+    return 0;
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    if (
+      error instanceof LeaseNotFoundError ||
+      (error instanceof ContractCallError && error.code === 5)
+    ) {
+      throw new CliError(`lease ${args.lease} was not found on chain`, 'lease_not_found');
+    }
+    if (error instanceof ContractCallError) {
+      if (error.code === 8) {
+        throw new CliError(`lease ${args.lease} has not expired yet`, 'lease_not_expired');
+      }
+      if (error.code === 14) {
+        throw new CliError(
+          'auth failure: consumer signature did not match lease consumer',
+          'auth_failure',
+        );
+      }
+    }
+    const msg = error instanceof Error ? error.message : String(error);
+    if (
+      msg.includes('not expired') ||
+      msg.includes('LeaseNotSettleable') ||
+      msg.includes('Error(8)')
+    ) {
+      throw new CliError(`lease ${args.lease} has not expired yet`, 'lease_not_expired');
+    }
+    if (msg.includes('not found') || msg.includes('Error(5)')) {
+      throw new CliError(`lease ${args.lease} was not found on chain`, 'lease_not_found');
+    }
+    if (msg.includes('auth') || msg.includes('unauthorized') || msg.includes('Error(14)')) {
+      throw new CliError('auth failure: consumer authorization failed', 'auth_failure');
+    }
+    throw error;
+  }
 }

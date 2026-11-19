@@ -4,6 +4,8 @@
  * allowed requests to the protected upstream API.
  */
 import { randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
+import type { ReadableStream as WebReadableStream } from 'node:stream/web';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type { LeaseVerifier } from './verifier.js';
 
@@ -27,6 +29,8 @@ export interface ProxyOptions {
   verifier: LeaseVerifier;
   /** Injectable `fetch` for tests. Defaults to the global fetch. */
   fetchImpl?: typeof fetch;
+  /** Optional allowlist of headers to forward upstream. */
+  allowedHeaders?: ReadonlySet<string> | string[];
   /** Fastify logger toggle. Defaults to `false`. */
   logger?: boolean;
   /** Forward the caller's lease token upstream. Defaults to `false`. */
@@ -86,9 +90,15 @@ export function resolveUpstreamUrl(upstream: string, rawUrl: string): string {
  */
 export function buildUpstreamHeaders(
   headers: Record<string, string | string[] | undefined>,
-  options: { forwardAuthorization?: boolean } = {},
+  options: {
+    forwardAuthorization?: boolean;
+    allowedHeaders?: ReadonlySet<string> | string[];
+  } = {},
 ): Record<string, string> {
   const out: Record<string, string> = {};
+  const allowlist = options.allowedHeaders
+    ? new Set(Array.from(options.allowedHeaders).map((h) => h.toLowerCase()))
+    : undefined;
   for (const [key, value] of Object.entries(headers)) {
     if (value === undefined) continue;
     const lower = key.toLowerCase();
@@ -97,6 +107,7 @@ export function buildUpstreamHeaders(
     if (lower.startsWith('x-keylease-')) continue;
     // Forwarding metadata is rebuilt by the proxy from trusted values only.
     if (lower.startsWith('x-forwarded-')) continue;
+    if (allowlist !== undefined && !allowlist.has(lower) && lower !== 'authorization') continue;
     out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
   }
   return out;
@@ -123,7 +134,7 @@ function copyResponseHeaders(reply: FastifyReply, headers: Headers): void {
   const setCookies = typeof headers.getSetCookie === 'function' ? headers.getSetCookie() : [];
   for (const [key, value] of headers) {
     const lower = key.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (HOP_BY_HOP_HEADERS.has(lower) && lower !== 'content-length') continue;
     if (lower === 'set-cookie') continue;
     if (lower === 'content-type' && value === undefined) continue;
     reply.header(lower, value);
@@ -170,6 +181,12 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
   app.addHook('onRequest', async (request, reply) => {
     inFlightRequests += 1;
+    // Strip client-supplied x-keylease-* headers before verification runs.
+    for (const key of Object.keys(request.headers)) {
+      if (key.toLowerCase().startsWith('x-keylease-')) {
+        delete request.headers[key];
+      }
+    }
     reply.header(REQUEST_ID_HEADER, request.id);
   });
 
@@ -297,7 +314,10 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
     const target = resolveUpstreamUrl(upstream, request.raw.url ?? '/');
     const method = request.method;
-    const headers = buildUpstreamHeaders(request.headers, { forwardAuthorization });
+    const headers = buildUpstreamHeaders(request.headers, {
+      forwardAuthorization,
+      allowedHeaders: options.allowedHeaders,
+    });
     const payload =
       allowsBody(method) && Buffer.isBuffer(request.body) && request.body.length > 0
         ? request.body
@@ -364,24 +384,49 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
       const emptyBody =
         method === 'HEAD' || response.status === 204 || response.status === 304;
-      if (emptyBody) {
+      if (emptyBody || response.body === null) {
         return reply.send();
       }
 
-      let responseBody: ArrayBuffer;
-      try {
-        responseBody = await response.arrayBuffer();
-      } catch (error) {
-        if (clientAbortController.signal.aborted) return reply;
-        throw error;
-      }
-      if (clientAbortController.signal.aborted) return reply;
       if (!response.headers.has('content-type')) {
         reply.type('application/octet-stream');
       }
-      return reply.send(Buffer.from(responseBody));
-    } finally {
+
+      const webStream = response.body;
+      const cancelUpstream = () => {
+        try {
+          webStream.cancel().catch(() => {});
+        } catch {
+          // stream might already be closed/cancelled
+        }
+      };
+
+      if (clientAbortController.signal.aborted) {
+        cancelUpstream();
+        return reply;
+      }
+      clientAbortController.signal.addEventListener('abort', cancelUpstream, { once: true });
+      request.raw.once('close', () => {
+        if (!reply.raw.writableEnded) {
+          cancelUpstream();
+          clientAbortController.abort();
+        }
+      });
+      reply.raw.once('close', () => {
+        if (!reply.raw.writableEnded) {
+          cancelUpstream();
+          clientAbortController.abort();
+        }
+      });
+      reply.raw.once('finish', () => {
+        socket.off('close', abortOnDisconnect);
+      });
+
+      const nodeStream = Readable.fromWeb(webStream as WebReadableStream);
+      return reply.send(nodeStream);
+    } catch (error) {
       socket.off('close', abortOnDisconnect);
+      throw error;
     }
   };
 

@@ -436,6 +436,15 @@ impl KeyleaseCore {
         Ok(lease)
     }
 
+    /// Consumer exit for expired leases: refunds unused calls and closes the lease.
+    pub fn revoke_expired_lease(env: Env, lease_id: u64) -> Result<Lease, Error> {
+        let lease = load_lease(&env, lease_id)?;
+        if lease.expires_at > env.ledger().timestamp() {
+            return Err(Error::LeaseNotSettleable);
+        }
+        Self::revoke(env, lease_id)
+    }
+
     /// Permissionless: settle an expired or exhausted lease. The provider is
     /// paid for consumed calls, the consumer gets the remainder back.
     pub fn settle(env: Env, lease_id: u64) -> Result<Lease, Error> {

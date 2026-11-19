@@ -219,6 +219,8 @@ describe('parseArgv', () => {
       expect(error.message).toContain(url);
       expect(error.message).toContain('localhost');
     }
+  });
+
   it('parses --dry-run acquire without a secret', () => {
     const invocation = parseArgv([
       'acquire',
@@ -563,5 +565,51 @@ describe('run', () => {
         status: 'active',
       },
     ]);
+  });
+
+  it('parses and dispatches release command', async () => {
+    const { io, out } = captureIo();
+    const parsed = parseArgv(['release', '--lease', '42', '--secret', SECRET, '--json']);
+    expect(parsed).toEqual({
+      command: 'release',
+      args: {
+        lease: '42',
+        secret: SECRET,
+        json: true,
+        network: undefined,
+        rpc: undefined,
+        contract: undefined,
+      },
+    });
+
+    const code = await run(['release', '--lease', '42', '--secret', SECRET, '--json'], io, {
+      release: {
+        createClient: () => ({
+          release: async () => ({
+            leaseId: '42',
+            refunded: 5000,
+            txHash: '0x123',
+            lease: {
+              leaseId: '42',
+              service: 'test',
+              provider: 'GP',
+              consumer: 'GC',
+              callsLimit: 10,
+              callsUsed: 5,
+              expiresAt: 1000,
+              active: false,
+              settled: true,
+              pricePaid: 10000,
+            },
+          }),
+        }),
+      },
+    });
+    expect(code).toBe(0);
+    expect(JSON.parse(out.join('\n'))).toEqual({
+      leaseId: '42',
+      refunded: 5000,
+      txHash: '0x123',
+    });
   });
 });

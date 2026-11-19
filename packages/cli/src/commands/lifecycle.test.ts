@@ -1,7 +1,7 @@
 import { Keypair } from '@stellar/stellar-sdk';
 import { describe, expect, it } from 'vitest';
-import { revokeCommand, settleCommand } from './lifecycle.js';
-import type { LeaseState } from '../client/soroban.js';
+import { releaseCommand, revokeCommand, settleCommand } from './lifecycle.js';
+import { ContractCallError, LeaseNotFoundError, type LeaseState } from '../client/soroban.js';
 import type { CliIo } from '../index.js';
 
 const consumer = Keypair.random();
@@ -86,5 +86,131 @@ describe('revokeCommand', () => {
     expect(code).toBe(0);
     expect(out.join('\n')).toContain('Lease 42 revoked');
     expect(out.join('\n')).toContain('refunded    : 9000');
+  });
+});
+
+describe('releaseCommand', () => {
+  it('submits revoke_expired_lease and renders the refund', async () => {
+    const { io, out } = captureIo();
+    const code = await releaseCommand(
+      { lease: '42', secret: consumer.secret(), json: false },
+      io,
+      {
+        createClient: () => ({
+          release: async () => ({
+            leaseId: '42',
+            refunded: 8000,
+            txHash: '0xabc123',
+            lease: lease({ callsUsed: 2 }),
+          }),
+        }),
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(out.join('\n')).toContain('Lease 42 released');
+    expect(out.join('\n')).toContain('refunded : 8000');
+    expect(out.join('\n')).toContain('txHash   : 0xabc123');
+  });
+
+  it('supports --json and returns { leaseId, refunded, txHash }', async () => {
+    const { io, out } = captureIo();
+    const code = await releaseCommand(
+      { lease: '42', secret: consumer.secret(), json: true },
+      io,
+      {
+        createClient: () => ({
+          release: async () => ({
+            leaseId: '42',
+            refunded: 8000,
+            txHash: '0xabc123',
+            lease: lease({ callsUsed: 2 }),
+          }),
+        }),
+      },
+    );
+
+    expect(code).toBe(0);
+    const parsed = JSON.parse(out.join('\n')) as Record<string, unknown>;
+    expect(parsed).toEqual({
+      leaseId: '42',
+      refunded: 8000,
+      txHash: '0xabc123',
+    });
+  });
+
+  it('throws CliError with lease_not_expired when lease has not expired yet', async () => {
+    const { io } = captureIo();
+    await expect(
+      releaseCommand(
+        { lease: '42', secret: consumer.secret(), json: false },
+        io,
+        {
+          createClient: () => ({
+            release: async () => {
+              throw new ContractCallError('revoke_expired_lease', 8, 'Error(8)');
+            },
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'lease_not_expired',
+    });
+  });
+
+  it('throws CliError with lease_not_found when lease does not exist', async () => {
+    const { io } = captureIo();
+    await expect(
+      releaseCommand(
+        { lease: '999', secret: consumer.secret(), json: false },
+        io,
+        {
+          createClient: () => ({
+            release: async () => {
+              throw new LeaseNotFoundError('999');
+            },
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'lease_not_found',
+    });
+  });
+
+  it('throws CliError with auth_failure when consumer authorization fails', async () => {
+    const { io } = captureIo();
+    await expect(
+      releaseCommand(
+        { lease: '42', secret: consumer.secret(), json: false },
+        io,
+        {
+          createClient: () => ({
+            release: async () => {
+              throw new ContractCallError('revoke_expired_lease', 14, 'Error(14)');
+            },
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'auth_failure',
+    });
+  });
+
+  it('rejects an invalid secret before touching the chain with auth_failure', async () => {
+    const { io } = captureIo();
+    await expect(
+      releaseCommand({ lease: '42', secret: 'bad-secret', json: false }, io, {
+        createClient: () => ({
+          release: async () => ({
+            leaseId: '42',
+            refunded: 0,
+            txHash: '',
+            lease: lease(),
+          }),
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: 'auth_failure',
+    });
   });
 });

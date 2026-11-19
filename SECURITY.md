@@ -37,6 +37,13 @@ Out of scope:
 - denial of service against the Soroban RPC endpoint itself
 - testnet-only operational issues (friendbot rate limits, unfunded demo keys)
 
+## Security Architecture & Hardening Notes
+
+- **Constant-time verification:** Session token verification in `@keylease/cli/token` executes Ed25519 signature verification via tweetnacl (constant time) and compares string payload claims (`lease_id`, `consumer`) using `node:crypto.timingSafeEqual` on equal-length UTF-8 byte buffers (`timingSafeEqualString`), preventing timing side-channel attacks during authentication.
+- **Header allowlisting & stripping:** Inbound client headers matching `x-keylease-*` and `x-forwarded-*` are stripped on request arrival (`onRequest` hook) before any lease verification occurs. Proxy-to-upstream forwarding removes hop-by-hop headers and supports an optional strict header allowlist (`allowedHeaders` in `ProxyOptions`).
+- **Body size limits & DoS protection:** Request payload limits (`maxBodyBytes`, defaulting to 32 MiB) are enforced by Fastify's content parser before lease verification. Payloads exceeding the configured limit are rejected with HTTP 413 (`payload_too_large`) without incurring blockchain RPC lookups or signature verification overhead.
+- **Upstream streaming:** Responses are streamed via `Readable.fromWeb` directly to the client instead of buffered in memory, preventing memory exhaustion on large responses while propagating client abort signals upstream.
+
 ## Audit status
 
 This software is **pre-1.0 and has not been independently audited**. Use it for

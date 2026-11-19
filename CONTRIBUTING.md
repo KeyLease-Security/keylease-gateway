@@ -17,6 +17,7 @@ pnpm build          # tsc emit for both packages
 pnpm test           # vitest: package suites + the PR-title rules in scripts/
 pnpm lint           # eslint
 pnpm typecheck      # build + tsc --noEmit
+pnpm test:e2e       # scripted end-to-end flow: proxy + simulated soroban network
 
 # contract (needs Rust + stellar-cli)
 pnpm contract:test  # cargo test (22 tests)

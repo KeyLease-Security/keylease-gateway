@@ -100,6 +100,7 @@ export interface ServiceState {
   provider: string;
   pricePerCall: number;
   active: boolean;
+  leaseCount?: number;
 }
 
 export interface CreateLeaseParams {
@@ -246,11 +247,14 @@ export function parseServiceState(value: xdr.ScVal): ServiceState {
   if (typeof service !== 'string') {
     throw new SorobanError('service field "service" must be a string');
   }
+  const rawCount = raw['lease_count'];
+  const leaseCount = typeof rawCount === 'number' || typeof rawCount === 'bigint' ? Number(rawCount) : 0;
   return {
     service,
     provider: requireAddress(raw['provider'], 'provider'),
     pricePerCall: requireFiniteNumber(raw['price_per_call'], 'price_per_call'),
     active: Boolean(raw['active']),
+    leaseCount,
   };
 }
 
@@ -526,6 +530,34 @@ export class SorobanClient {
     return parseLeaseState(returnValue, leaseId);
   }
 
+  /** Consumer-side release / refund of an expired lease. */
+  async release(
+    leaseId: string,
+    consumer: Keypair,
+  ): Promise<{ leaseId: string; refunded: number; txHash: string; lease: LeaseState }> {
+    const id = parseLeaseId(leaseId);
+    try {
+      const { returnValue, txHash } = await this.invoke({
+        signer: consumer,
+        method: 'revoke_expired_lease',
+        args: [nativeToScVal(id, { type: 'u64' })],
+      });
+      if (!returnValue) throw new SorobanError('revoke_expired_lease returned no lease');
+      const lease = parseLeaseState(returnValue, leaseId);
+      const paidOut =
+        lease.callsLimit === 0
+          ? 0
+          : Math.floor((lease.pricePaid * lease.callsUsed) / lease.callsLimit);
+      const refunded = lease.pricePaid - paidOut;
+      return { leaseId, refunded, txHash, lease };
+    } catch (error) {
+      if (error instanceof ContractCallError && error.code === 5) {
+        throw new LeaseNotFoundError(leaseId);
+      }
+      throw error;
+    }
+  }
+
   /** Provider-side service registration / price update. */
   async registerService(
     provider: Keypair,
@@ -692,6 +724,9 @@ function transactionResultName(result: unknown): string {
  * @throws SorobanError if the URL is invalid or does not meet the scheme requirements
  */
 export function validateRpcUrl(url: string): void {
+  if (!url.includes('://')) {
+    throw new SorobanError(`invalid RPC URL "${url}": must be a valid URL`);
+  }
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -707,7 +742,7 @@ export function validateRpcUrl(url: string): void {
   // Allow http: only for localhost/127.0.0.1
   if (scheme === 'http:') {
     const hostname = parsed.hostname;
-    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1' && hostname !== '[::1]') {
       throw new SorobanError(
         `invalid RPC URL "${url}": http: is only allowed for localhost, not ${hostname}`,
       );

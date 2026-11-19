@@ -19,6 +19,7 @@
     "clean": "pnpm -r exec rm -rf dist coverage *.tsbuildinfo",
     "contract:build": "cd contracts/keylease-core && stellar contract build",
     "contract:test": "cd contracts/keylease-core && cargo test",
+    "test:e2e": "node scripts/test-e2e.mjs",
     "deploy:testnet": "node packages/cli/scripts/deploy-testnet.mjs"
   },
   "devDependencies": {
