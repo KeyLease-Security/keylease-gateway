@@ -436,11 +436,12 @@ An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 | `register_service(provider, service, price_per_call)` | provider | Register or re-price a service (`price_per_call > 0`) |
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
-| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
+| `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. Bounded by `MAX_CALLS` (1,000,000) and `MAX_DURATION` (365 days = 31,536,000s). `consumer` must not be the contract itself |
 | `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
+| `list_services(start, limit)` | – | Paginated list of registered service IDs (page size capped at 50, append-only) |
 | `version()` | – | Contract ABI version as a `String`, equal to the crate version in `Cargo.toml`; callable before `init` |
 
 `version()` follows semver on the contract ABI: **patch** for internal fixes
@@ -483,7 +484,10 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
 
 Escrow invariant: the contract only ever pays out `price_paid` once per lease,
-split as `used/total` to the provider and `(total-used)/total` to the consumer.
+split as `used/total` to the provider and `price_paid - payable` to the consumer.
+Both `settle` and `revoke` share the same `calculate_payout` helper; any rounding
+dust from integer division truncation is awarded to the consumer refund,
+guaranteeing `payable + refund == price_paid`.
 
 ---
 

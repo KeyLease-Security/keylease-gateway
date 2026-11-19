@@ -570,6 +570,17 @@ export class SorobanClient {
     return parseServiceState(retval);
   }
 
+  /** Returns a page of registered service IDs by simulating `list_services`. */
+  async listServices(start = 0, limit = 50): Promise<string[]> {
+    const retval = await this.simulate('list_services', [
+      nativeToScVal(start, { type: 'u32' }),
+      nativeToScVal(limit, { type: 'u32' }),
+    ]);
+    const native = scValToNative(retval);
+    if (!Array.isArray(native)) return [];
+    return native.map((s) => String(s));
+  }
+
   /** Price of `calls` calls on `service`, in token smallest units. */
   async quote(service: string, calls: number): Promise<number> {
     if (!Number.isInteger(calls) || calls <= 0) {
@@ -692,6 +703,9 @@ function transactionResultName(result: unknown): string {
  * @throws SorobanError if the URL is invalid or does not meet the scheme requirements
  */
 export function validateRpcUrl(url: string): void {
+  if (!url.includes('://')) {
+    throw new SorobanError(`invalid RPC URL "${url}": must be a valid URL`);
+  }
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -707,7 +721,7 @@ export function validateRpcUrl(url: string): void {
   // Allow http: only for localhost/127.0.0.1
   if (scheme === 'http:') {
     const hostname = parsed.hostname;
-    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1' && hostname !== '[::1]') {
       throw new SorobanError(
         `invalid RPC URL "${url}": http: is only allowed for localhost, not ${hostname}`,
       );

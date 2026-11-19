@@ -40,6 +40,9 @@ import { CliError } from './errors.js';
 
 export { CliError } from './errors.js';
 
+export const MAX_CALLS = 1_000_000;
+export const MAX_DURATION = 31_536_000;
+
 export const CLI_NAME = 'keylease';
 export const CLI_VERSION = '0.1.0';
 
@@ -171,7 +174,12 @@ function validateRpcUrl(url: string): void {
   // Allow http: only for localhost/127.0.0.1
   if (scheme === 'http:') {
     const hostname = parsed.hostname;
-    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+    if (
+      hostname !== 'localhost' &&
+      hostname !== '127.0.0.1' &&
+      hostname !== '::1' &&
+      hostname !== '[::1]'
+    ) {
       throw new CliError(
         `invalid --rpc URL "${url}": http: is only allowed for localhost, not ${hostname}`,
         'invalid_option',
@@ -248,11 +256,22 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
       if (!dryRun && secret === undefined) {
         throw new CliError('--secret is required unless --dry-run is set', 'missing_option');
       }
+      const calls = requirePositiveInt(values, 'calls');
+      if (calls > MAX_CALLS) {
+        throw new CliError(`--calls cannot exceed ${MAX_CALLS}, got ${calls}`, 'invalid_option');
+      }
+      const duration = requirePositiveInt(values, 'duration');
+      if (duration > MAX_DURATION) {
+        throw new CliError(
+          `--duration cannot exceed ${MAX_DURATION} seconds (365 days), got ${duration}`,
+          'invalid_option',
+        );
+      }
       const args: AcquireArgs = {
         ...networkArgs(values),
         service: serviceFrom(values, options),
-        calls: requirePositiveInt(values, 'calls'),
-        duration: requirePositiveInt(values, 'duration'),
+        calls,
+        duration,
         secret,
         dryRun,
         json: values.json === true,

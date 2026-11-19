@@ -219,6 +219,8 @@ describe('parseArgv', () => {
       expect(error.message).toContain(url);
       expect(error.message).toContain('localhost');
     }
+  });
+
   it('parses --dry-run acquire without a secret', () => {
     const invocation = parseArgv([
       'acquire',
@@ -324,6 +326,36 @@ describe('parseArgv', () => {
           '--calls',
           '5',
           '--duration=-10',
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
+    expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '1000001',
+          '--duration',
+          '60',
+          '--secret',
+          SECRET,
+        ]),
+      'invalid_option',
+    );
+    expectCliError(
+      () =>
+        parseArgv([
+          'acquire',
+          '--service',
+          'x',
+          '--calls',
+          '5',
+          '--duration',
+          '31536001',
           '--secret',
           SECRET,
         ]),
