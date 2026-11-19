@@ -26,7 +26,8 @@ In scope:
 - escrow bugs in `contracts/keylease-core`: paying a provider twice, releasing
   more than `price_paid`, settling an active lease, refunding a revoked lease
 - authorisation gaps: `use_call` without the gateway, `revoke` without the
-  consumer, service mutation without its provider, `init` replay
+  consumer, service mutation without its provider, `init` replay, or bypassing
+  admin/gateway role separation (`admin != gateway`)
 - Soroban RPC response spoofing / cache poisoning
 - secret leakage (Stellar secret seeds, session tokens) in CLI output, logs or files
 - header injection or request smuggling through the reverse proxy

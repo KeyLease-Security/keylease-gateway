@@ -429,7 +429,7 @@ An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 
 | Entry point | Auth | Description |
 | --- | --- | --- |
-| `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account |
+| `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account (`admin != gateway`) |
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
 | `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
 | `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
@@ -437,7 +437,7 @@ An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 | `set_service_active(provider, service, active)` | provider | Pause / resume a service |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
 | `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
-| `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |
+| `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with schema version and `(calls_used, remaining)` |
 | `revoke(lease_id)` | consumer | Refunds unused calls immediately |
 | `settle(lease_id)` | – (permissionless) | After expiry/exhaustion: pays provider, refunds consumer |
 | `get_lease(id)` · `get_service(id)` · `get_config()` · `remaining_calls(id)` | – | Views used by the CLI and proxy |
@@ -458,14 +458,22 @@ and on reads: `load_config`, `load_service` and `load_lease` extend the entry
 when its TTL falls below `MIN_TTL`, so a lease that is only ever simulated or
 read stays alive. `extend_ttl` is a no-op above the threshold, so the hot read
 path costs one storage access and no write.
-Events: `init`, `gateway`, `admin_proposed`, `admin_changed`,
-`service_registered`, `lease_created`, `calls_committed`, `lease_revoked`,
-`lease_settled`.
 
-`calls_committed` keeps its `(calls_committed, consumer, lease_id)` topic
-tuple, so existing topic filters still match, but its payload is now the pair
-`(calls_used, remaining)`. Both fields are `u32`; indexers that decoded a bare
-`calls_used` value must read the pair (or the first element).
+### Event catalogue
+
+All contract events are emitted through centralized helpers with `SCHEMA_VERSION = 1` as the first field of the data payload:
+
+| Event | Topics | Data Payload | Description |
+| --- | --- | --- | --- |
+| `init` | `[init, admin]` | `(1u32, timestamp)` | Contract initialized |
+| `gateway` | `[gateway, new_gateway]` | `(1u32, timestamp)` | Gateway account rotated |
+| `admin_proposed` | `[admin_proposed, current_admin, pending_admin]` | `(1u32, timestamp)` | Admin nomination proposed |
+| `admin_changed` | `[admin_changed, old_admin, new_admin]` | `(1u32, timestamp)` | Admin nomination accepted |
+| `service_registered` | `[service_registered, provider]` | `(1u32, service_id, price_per_call)` | Service registered or re-priced |
+| `lease_created` | `[lease_created, consumer, lease_id]` | `(1u32, service_id, calls_limit, price_paid)` | New lease created and escrow funded |
+| `calls_committed` | `[calls_committed, consumer, lease_id]` | `(1u32, calls_used, remaining)` | Calls committed by gateway |
+| `lease_revoked` | `[lease_revoked, consumer, lease_id]` | `(1u32, refund_amount)` | Lease revoked early by consumer |
+| `lease_settled` | `[lease_settled, provider, lease_id]` | `(1u32, provider_payout, consumer_refund)` | Escrow settled after expiry/exhaustion |
 
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 `Error(Contract, #n)`:
@@ -481,6 +489,7 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 9 | `AlreadySettled` | Escrow already paid out |
 | 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation |
 | 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
+| 16 | `SameAdminAndGateway` | `init` rejects identical admin and gateway addresses |
 
 Escrow invariant: the contract only ever pays out `price_paid` once per lease,
 split as `used/total` to the provider and `(total-used)/total` to the consumer.

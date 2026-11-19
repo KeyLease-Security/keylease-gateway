@@ -628,7 +628,7 @@ fn admin_transfer_emits_proposal_and_change_events() {
                         next.clone().into_val(&h.env),
                     ],
                 ),
-                h.env.ledger().timestamp().into_val(&h.env),
+                (1u32, h.env.ledger().timestamp()).into_val(&h.env),
             )],
         ),
     );
@@ -647,7 +647,7 @@ fn admin_transfer_emits_proposal_and_change_events() {
                         next.clone().into_val(&h.env),
                     ],
                 ),
-                h.env.ledger().timestamp().into_val(&h.env),
+                (1u32, h.env.ledger().timestamp()).into_val(&h.env),
             )],
         ),
     );
@@ -680,7 +680,7 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(h.client.address.clone(), topics(), (3u32, 7u32).into_val(&h.env))],
+            [(h.client.address.clone(), topics(), (1u32, 3u32, 7u32).into_val(&h.env))],
         ),
     );
 
@@ -690,7 +690,7 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(h.client.address.clone(), topics(), (10u32, 0u32).into_val(&h.env))],
+            [(h.client.address.clone(), topics(), (1u32, 10u32, 0u32).into_val(&h.env))],
         ),
     );
 }
@@ -708,4 +708,244 @@ fn escrow_survives_many_leases() {
         total += 10_000;
     }
     assert_eq!(balance(&h, &h.client.address), total);
+}
+
+#[test]
+fn init_rejects_identical_admin_and_gateway() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let contract_id = env.register(KeyleaseCore, ());
+    let client = KeyleaseCoreClient::new(&env, &contract_id);
+
+    // Initialising with admin == gateway must fail with SameAdminAndGateway (error 16)
+    let err = client.try_init(&admin, &token, &admin);
+    assert_eq!(err, Err(Ok(Error::SameAdminAndGateway)));
+}
+
+#[test]
+fn revoke_and_settle_guards_prevent_double_payout() {
+    let h = setup();
+    register(&h);
+
+    // --- Sequence 1: revoke -> settle ---
+    let id1 = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &100);
+    h.client.use_call(&id1, &4);
+    h.client.revoke(&id1);
+
+    let consumer_bal1 = balance(&h, &h.consumer);
+    let provider_bal1 = balance(&h, &h.provider);
+    let contract_bal1 = balance(&h, &h.client.address);
+
+    // Second call (settle) must fail with AlreadySettled and leave balances strictly untouched
+    let err_settle1 = h.client.try_settle(&id1);
+    assert_eq!(err_settle1, Err(Ok(Error::AlreadySettled)));
+    assert_eq!(balance(&h, &h.consumer), consumer_bal1);
+    assert_eq!(balance(&h, &h.provider), provider_bal1);
+    assert_eq!(balance(&h, &h.client.address), contract_bal1);
+
+    // --- Sequence 2: settle -> revoke ---
+    let id2 = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &100);
+    h.client.use_call(&id2, &4);
+    // Advance time past expiry
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + 101);
+    h.client.settle(&id2);
+
+    let consumer_bal2 = balance(&h, &h.consumer);
+    let provider_bal2 = balance(&h, &h.provider);
+    let contract_bal2 = balance(&h, &h.client.address);
+
+    // Second call (revoke) must fail with AlreadySettled and leave balances untouched
+    let err_revoke2 = h.client.try_revoke(&id2);
+    assert_eq!(err_revoke2, Err(Ok(Error::AlreadySettled)));
+    assert_eq!(balance(&h, &h.consumer), consumer_bal2);
+    assert_eq!(balance(&h, &h.provider), provider_bal2);
+    assert_eq!(balance(&h, &h.client.address), contract_bal2);
+
+    // --- Sequence 3: settle -> settle ---
+    let err_settle2 = h.client.try_settle(&id2);
+    assert_eq!(err_settle2, Err(Ok(Error::AlreadySettled)));
+    assert_eq!(balance(&h, &h.consumer), consumer_bal2);
+    assert_eq!(balance(&h, &h.provider), provider_bal2);
+    assert_eq!(balance(&h, &h.client.address), contract_bal2);
+}
+
+#[test]
+fn golden_tests_for_event_topics_and_payloads() {
+    use soroban_sdk::{testutils::Events as _, IntoVal, Symbol, Vec as SVec};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let gateway = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let consumer = Address::generate(&env);
+
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    StellarAssetClient::new(&env, &token).mint(&consumer, &1_000_000);
+
+    let contract_id = env.register(KeyleaseCore, ());
+    let client = KeyleaseCoreClient::new(&env, &contract_id);
+
+    // 1. init event
+    client.init(&admin, &token, &gateway);
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        SVec::from_array(
+            &env,
+            [(
+                contract_id.clone(),
+                SVec::from_array(
+                    &env,
+                    [
+                        Symbol::new(&env, "init").into_val(&env),
+                        admin.clone().into_val(&env),
+                    ],
+                ),
+                (1u32, env.ledger().timestamp()).into_val(&env),
+            )],
+        ),
+    );
+
+    // 2. set_gateway event
+    let new_gateway = Address::generate(&env);
+    client.set_gateway(&new_gateway);
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        SVec::from_array(
+            &env,
+            [(
+                contract_id.clone(),
+                SVec::from_array(
+                    &env,
+                    [
+                        Symbol::new(&env, "gateway").into_val(&env),
+                        new_gateway.clone().into_val(&env),
+                    ],
+                ),
+                (1u32, env.ledger().timestamp()).into_val(&env),
+            )],
+        ),
+    );
+
+    // 3. register_service event
+    let service = String::from_str(&env, "weather-api");
+    client.register_service(&provider, &service, &1_000);
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        SVec::from_array(
+            &env,
+            [(
+                contract_id.clone(),
+                SVec::from_array(
+                    &env,
+                    [
+                        Symbol::new(&env, "service_registered").into_val(&env),
+                        provider.clone().into_val(&env),
+                    ],
+                ),
+                (1u32, service.clone(), 1_000i128).into_val(&env),
+            )],
+        ),
+    );
+
+    // 4. lease_created event
+    let lease_id = client.create_lease(&consumer, &service, &10, &3_600);
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        SVec::from_array(
+            &env,
+            [(
+                contract_id.clone(),
+                SVec::from_array(
+                    &env,
+                    [
+                        Symbol::new(&env, "lease_created").into_val(&env),
+                        consumer.clone().into_val(&env),
+                        lease_id.into_val(&env),
+                    ],
+                ),
+                (1u32, service.clone(), 10u32, 10_000i128).into_val(&env),
+            )],
+        ),
+    );
+
+    // 5. calls_committed event
+    client.use_call(&lease_id, &3);
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        SVec::from_array(
+            &env,
+            [(
+                contract_id.clone(),
+                SVec::from_array(
+                    &env,
+                    [
+                        Symbol::new(&env, "calls_committed").into_val(&env),
+                        consumer.clone().into_val(&env),
+                        lease_id.into_val(&env),
+                    ],
+                ),
+                (1u32, 3u32, 7u32).into_val(&env),
+            )],
+        ),
+    );
+
+    // 6. lease_revoked event
+    let lease_id2 = client.create_lease(&consumer, &service, &10, &3_600);
+    client.revoke(&lease_id2);
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        SVec::from_array(
+            &env,
+            [(
+                contract_id.clone(),
+                SVec::from_array(
+                    &env,
+                    [
+                        Symbol::new(&env, "lease_revoked").into_val(&env),
+                        consumer.clone().into_val(&env),
+                        lease_id2.into_val(&env),
+                    ],
+                ),
+                (1u32, 10_000i128).into_val(&env),
+            )],
+        ),
+    );
+
+    // 7. lease_settled event
+    let lease_id3 = client.create_lease(&consumer, &service, &10, &60);
+    client.use_call(&lease_id3, &6);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 61);
+    client.settle(&lease_id3);
+    assert_eq!(
+        env.events().all().filter_by_contract(&contract_id),
+        SVec::from_array(
+            &env,
+            [(
+                contract_id.clone(),
+                SVec::from_array(
+                    &env,
+                    [
+                        Symbol::new(&env, "lease_settled").into_val(&env),
+                        provider.clone().into_val(&env),
+                        lease_id3.into_val(&env),
+                    ],
+                ),
+                (1u32, 6_000i128, 4_000i128).into_val(&env),
+            )],
+        ),
+    );
 }

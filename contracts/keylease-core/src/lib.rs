@@ -59,6 +59,8 @@ pub enum Error {
     Unauthorized = 14,
     /// `create_lease` was called with the contract itself as consumer.
     InvalidConsumer = 15,
+    /// `init` was called with identical addresses for admin and gateway.
+    SameAdminAndGateway = 16,
 }
 
 #[contracttype]
@@ -173,6 +175,101 @@ fn store_lease(env: &Env, lease: &Lease) {
     bump_persistent_ttl(env, &key);
 }
 
+/// Versioned event emission helpers for consistent topic tuples and payload schemas.
+pub mod events {
+    use super::*;
+
+    /// Current event payload schema version.
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn emit_init(env: &Env, admin: &Address) {
+        env.events().publish(
+            (Symbol::new(env, "init"), admin.clone()),
+            (SCHEMA_VERSION, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn emit_gateway(env: &Env, gateway: &Address) {
+        env.events().publish(
+            (Symbol::new(env, "gateway"), gateway.clone()),
+            (SCHEMA_VERSION, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn emit_admin_proposed(env: &Env, current_admin: &Address, new_admin: &Address) {
+        env.events().publish(
+            (Symbol::new(env, "admin_proposed"), current_admin.clone(), new_admin.clone()),
+            (SCHEMA_VERSION, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn emit_admin_changed(env: &Env, new_admin: &Address) {
+        env.events().publish(
+            (Symbol::new(env, "admin_changed"), new_admin.clone()),
+            (SCHEMA_VERSION, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn emit_service_registered(
+        env: &Env,
+        provider: &Address,
+        service: &soroban_sdk::String,
+        price_per_call: i128,
+    ) {
+        env.events().publish(
+            (Symbol::new(env, "service_registered"), provider.clone()),
+            (SCHEMA_VERSION, service.clone(), price_per_call),
+        );
+    }
+
+    pub fn emit_lease_created(
+        env: &Env,
+        consumer: &Address,
+        lease_id: u64,
+        service: &soroban_sdk::String,
+        calls: u32,
+        amount: i128,
+    ) {
+        env.events().publish(
+            (Symbol::new(env, "lease_created"), consumer.clone(), lease_id),
+            (SCHEMA_VERSION, service.clone(), calls, amount),
+        );
+    }
+
+    pub fn emit_calls_committed(
+        env: &Env,
+        consumer: &Address,
+        lease_id: u64,
+        calls_used: u32,
+        remaining: u32,
+    ) {
+        env.events().publish(
+            (Symbol::new(env, "calls_committed"), consumer.clone(), lease_id),
+            (SCHEMA_VERSION, calls_used, remaining),
+        );
+    }
+
+    pub fn emit_lease_revoked(env: &Env, consumer: &Address, lease_id: u64, refund: i128) {
+        env.events().publish(
+            (Symbol::new(env, "lease_revoked"), consumer.clone(), lease_id),
+            (SCHEMA_VERSION, refund),
+        );
+    }
+
+    pub fn emit_lease_settled(
+        env: &Env,
+        provider: &Address,
+        lease_id: u64,
+        payable: i128,
+        refund: i128,
+    ) {
+        env.events().publish(
+            (Symbol::new(env, "lease_settled"), provider.clone(), lease_id),
+            (SCHEMA_VERSION, payable, refund),
+        );
+    }
+}
+
 #[contractimpl]
 impl KeyleaseCore {
     /// One-time setup. `token` is the SEP-41 asset used for escrow and
@@ -180,6 +277,9 @@ impl KeyleaseCore {
     pub fn init(env: Env, admin: Address, token: Address, gateway: Address) -> Result<(), Error> {
         if env.storage().instance().has(&config_key()) {
             return Err(Error::AlreadyInitialized);
+        }
+        if admin == gateway {
+            return Err(Error::SameAdminAndGateway);
         }
         admin.require_auth();
         store_config(
@@ -191,10 +291,7 @@ impl KeyleaseCore {
                 lease_count: 0,
             },
         );
-        env.events().publish(
-            (Symbol::new(&env, "init"), admin),
-            env.ledger().timestamp(),
-        );
+        events::emit_init(&env, &admin);
         Ok(())
     }
 
@@ -204,8 +301,7 @@ impl KeyleaseCore {
         config.admin.require_auth();
         config.gateway = gateway.clone();
         store_config(&env, &config);
-        env.events()
-            .publish((Symbol::new(&env, "gateway"), gateway), env.ledger().timestamp());
+        events::emit_gateway(&env, &gateway);
         Ok(())
     }
 
@@ -219,10 +315,7 @@ impl KeyleaseCore {
             .instance()
             .set(&DataKey::PendingAdmin, &new_admin);
         bump_instance_ttl(&env);
-        env.events().publish(
-            (Symbol::new(&env, "admin_proposed"), config.admin, new_admin),
-            env.ledger().timestamp(),
-        );
+        events::emit_admin_proposed(&env, &config.admin, &new_admin);
         Ok(())
     }
 
@@ -240,10 +333,7 @@ impl KeyleaseCore {
         config.admin = pending.clone();
         env.storage().instance().remove(&DataKey::PendingAdmin);
         store_config(&env, &config);
-        env.events().publish(
-            (Symbol::new(&env, "admin_changed"), pending),
-            env.ledger().timestamp(),
-        );
+        events::emit_admin_changed(&env, &pending);
         Ok(())
     }
 
@@ -268,10 +358,7 @@ impl KeyleaseCore {
         let key = DataKey::Service(service.clone());
         env.storage().persistent().set(&key, &stored);
         bump_persistent_ttl(&env, &key);
-        env.events().publish(
-            (Symbol::new(&env, "service_registered"), provider),
-            (service, price_per_call),
-        );
+        events::emit_service_registered(&env, &provider, &service, price_per_call);
         Ok(stored)
     }
 
@@ -367,11 +454,7 @@ impl KeyleaseCore {
             price_paid: amount,
         };
         store_lease(&env, &lease);
-
-        env.events().publish(
-            (Symbol::new(&env, "lease_created"), consumer, id),
-            (service, calls, amount),
-        );
+        events::emit_lease_created(&env, &consumer, id, &service, calls, amount);
         Ok(id)
     }
 
@@ -380,7 +463,7 @@ impl KeyleaseCore {
     ///
     /// The `calls_committed` event keeps its
     /// `(calls_committed, consumer, lease_id)` topic tuple and publishes
-    /// `(calls_used, remaining)` so indexers do not need a second read.
+    /// `(1, calls_used, remaining)` so indexers do not need a second read.
     pub fn use_call(env: Env, lease_id: u64, count: u32) -> Result<Lease, Error> {
         let config = load_config(&env)?;
         config.gateway.require_auth();
@@ -399,10 +482,7 @@ impl KeyleaseCore {
         lease.calls_used = lease.calls_used.saturating_add(count).min(lease.calls_limit);
         store_lease(&env, &lease);
         let remaining = lease.calls_limit.saturating_sub(lease.calls_used);
-        env.events().publish(
-            (Symbol::new(&env, "calls_committed"), lease.consumer.clone(), lease_id),
-            (lease.calls_used, remaining),
-        );
+        events::emit_calls_committed(&env, &lease.consumer, lease_id, lease.calls_used, remaining);
         Ok(lease)
     }
 
@@ -429,10 +509,7 @@ impl KeyleaseCore {
         lease.active = false;
         lease.settled = true;
         store_lease(&env, &lease);
-        env.events().publish(
-            (Symbol::new(&env, "lease_revoked"), lease.consumer.clone(), lease_id),
-            refund,
-        );
+        events::emit_lease_revoked(&env, &lease.consumer, lease_id, refund);
         Ok(lease)
     }
 
@@ -466,10 +543,7 @@ impl KeyleaseCore {
         lease.active = false;
         lease.settled = true;
         store_lease(&env, &lease);
-        env.events().publish(
-            (Symbol::new(&env, "lease_settled"), lease.provider.clone(), lease_id),
-            (payable, refund),
-        );
+        events::emit_lease_settled(&env, &lease.provider, lease_id, payable, refund);
         Ok(lease)
     }
 
