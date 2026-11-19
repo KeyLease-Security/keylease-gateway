@@ -3,6 +3,8 @@ import { mintSessionToken } from '@keylease/cli/token';
 import type { LeaseState } from '@keylease/cli/soroban';
 import { describe, expect, it, vi } from 'vitest';
 import { LeaseVerifier, extractBearerToken, type LeaseStateProvider } from './verifier.js';
+import { TtlCache } from './cache.js';
+import { OnChainQuota } from './quota.js';
 
 const START = 1_700_000_000;
 const consumer = Keypair.random();
@@ -531,6 +533,188 @@ describe('deterministic quota-exhaustion race tests', () => {
         expect(d).toMatchObject({ ok: false, status: 403, reason: 'quota_exhausted' });
       }
       expect(verifier.localCalls('lease-1')).toBe(M);
+    }
+  });
+});
+
+describe('LeaseVerifier service binding', () => {
+  it('admits requests when lease service matches configured serviceId', async () => {
+    const lease = leaseState({ service: 'weather-api' });
+    const verifier = new LeaseVerifier({
+      provider: { getLeaseState: async () => lease },
+      serviceId: 'weather-api',
+      clock: () => START * 1000,
+    });
+
+    const result = await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(result.ok).toBe(true);
+  });
+
+  it('denies requests with 429/403 lease_service_mismatch when lease service differs', async () => {
+    const lease = leaseState({ service: 'cheap-api' });
+    const verifier = new LeaseVerifier({
+      provider: { getLeaseState: async () => lease },
+      serviceId: 'expensive-api',
+      clock: () => START * 1000,
+    });
+
+    const result = await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(result).toMatchObject({
+      ok: false,
+      status: 403,
+      reason: 'lease_service_mismatch',
+    });
+  });
+
+  it('permits any service when serviceId is unset', async () => {
+    const lease = leaseState({ service: 'any-service' });
+    const verifier = new LeaseVerifier({
+      provider: { getLeaseState: async () => lease },
+      clock: () => START * 1000,
+    });
+
+    const result = await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(result.ok).toBe(true);
+  });
+
+  it('does not reuse a cached state under a different service binding', async () => {
+    const cache = new TtlCache<LeaseState>({ ttlMs: 30_000 });
+    const leaseA = leaseState({ leaseId: 'lease-1', service: 'service-a' });
+    const leaseB = leaseState({ leaseId: 'lease-1', service: 'service-b' });
+
+    let activeService = 'service-a';
+    const provider: LeaseStateProvider = {
+      getLeaseState: async () => (activeService === 'service-a' ? leaseA : leaseB),
+    };
+
+    const verifierA = new LeaseVerifier({
+      provider,
+      cache,
+      serviceId: 'service-a',
+      clock: () => START * 1000,
+    });
+
+    const resA = await verifierA.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(resA.ok).toBe(true);
+
+    activeService = 'service-b';
+    const verifierB = new LeaseVerifier({
+      provider,
+      cache,
+      serviceId: 'service-b',
+      clock: () => START * 1000,
+    });
+
+    // Verifier B with serviceId 'service-b' must not reuse the cache entry from verifier A
+    const resB = await verifierB.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(resB.ok).toBe(true);
+    if (resB.ok) {
+      expect(resB.lease.service).toBe('service-b');
+    }
+  });
+});
+
+describe('LeaseVerifier per-lease token bucket rate limit', () => {
+  it('allows burst up to rateLimitPerMinute then returns 429 rate_limited with Retry-After', async () => {
+    let now = START * 1000;
+    const lease = leaseState({ callsLimit: 100 });
+    const verifier = new LeaseVerifier({
+      provider: { getLeaseState: async () => lease },
+      rateLimitPerMinute: 2, // 2 requests per minute
+      clock: () => now,
+    });
+
+    const header = `Bearer ${tokenFor('lease-1')}`;
+
+    // First request: consumes 1 token (1 remaining)
+    const r1 = await verifier.verifyAuthorization(header);
+    expect(r1.ok).toBe(true);
+    expect(verifier.localCalls('lease-1')).toBe(1);
+
+    // Second request: consumes 1 token (0 remaining)
+    const r2 = await verifier.verifyAuthorization(header);
+    expect(r2.ok).toBe(true);
+    expect(verifier.localCalls('lease-1')).toBe(2);
+
+    // Third request: burst exhausted -> 429
+    const r3 = await verifier.verifyAuthorization(header);
+    expect(r3).toMatchObject({
+      ok: false,
+      status: 429,
+      reason: 'rate_limited',
+    });
+    if (!r3.ok) {
+      expect(r3.retryAfter).toBeGreaterThanOrEqual(1);
+    }
+    // Quota was NOT consumed for denied request
+    expect(verifier.localCalls('lease-1')).toBe(2);
+
+    // Advance clock by 30 seconds (1 token refilled)
+    now += 30_000;
+    const r4 = await verifier.verifyAuthorization(header);
+    expect(r4.ok).toBe(true);
+    expect(verifier.localCalls('lease-1')).toBe(3);
+  });
+});
+
+describe('LeaseVerifier LRU counter eviction invariant', () => {
+  it('eviction with maxCounters: 2 flushes through quota sink and prevents double spending', async () => {
+    let onChainCallsUsed = 0;
+    const committer = {
+      useCalls: vi.fn(async (leaseId: string, count: number) => {
+        if (leaseId === 'lease-1') {
+          onChainCallsUsed += count;
+        }
+      }),
+    };
+    const quotaSink = new OnChainQuota({
+      committer,
+      batchSize: 100, // manual flushes
+    });
+
+    const provider: LeaseStateProvider = {
+      getLeaseState: vi.fn(async (leaseId: string) => {
+        return leaseState({
+          leaseId,
+          callsLimit: 5,
+          callsUsed: leaseId === 'lease-1' ? onChainCallsUsed : 0,
+        });
+      }),
+    };
+
+    const verifier = new LeaseVerifier({
+      provider,
+      maxCounters: 2,
+      quotaSink,
+      clock: () => START * 1000,
+    });
+
+    // 1. Lease 1 uses 2 calls
+    await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(verifier.localCalls('lease-1')).toBe(2);
+
+    // 2. Lease 2 uses 1 call
+    await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-2')}`);
+    expect(verifier.localCalls('lease-2')).toBe(1);
+
+    // Currently tracking 2 counters: lease-1 and lease-2.
+    // 3. Lease 3 makes a call -> triggers eviction of oldest (lease-1).
+    // Eviction must flush quotaSink before deleting lease-1 from calls and cache.
+    await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-3')}`);
+    expect(committer.useCalls).toHaveBeenCalled();
+    expect(onChainCallsUsed).toBe(2); // lease-1's 2 calls committed to chain!
+
+    // Lease 1 was evicted from local calls:
+    expect(verifier.localCalls('lease-1')).toBe(0);
+
+    // 4. Lease 1 comes back!
+    // Since cache was invalidated, it fetches from provider which reports callsUsed: 2.
+    const res = await verifier.verifyAuthorization(`Bearer ${tokenFor('lease-1')}`);
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      // 5 total limit - 2 previously used - 1 currently served = 2 remaining
+      expect(res.remainingCalls).toBe(2);
     }
   });
 });

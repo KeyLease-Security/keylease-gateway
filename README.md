@@ -502,6 +502,10 @@ split as `used/total` to the provider and `(total-used)/total` to the consumer.
 | `KEYLEASE_MAX_BODY_BYTES` | no | `33554432` (32 MiB) | Maximum allowed request body size in bytes |
 | `KEYLEASE_TRUST_PROXY` | no | `false` | Trusted edge proxies for `x-forwarded-*`: `true`, a hop count, or a comma-separated IP/CIDR list. When off, inbound `x-forwarded-*` headers are dropped and rebuilt from the socket |
 | `KEYLEASE_MAX_INFLIGHT` | no | `1024` | Maximum concurrent proxied requests. Excess requests get `503` with `Retry-After: 1` before any quota is charged; `0` disables the cap |
+| `KEYLEASE_SERVICE_ID` | no | – | Optional upstream service identifier. When set, verifies that the lease was issued for this service (mismatches get `403 lease_service_mismatch`). Omitting this variable restores permissive behavior |
+| `KEYLEASE_RATE_LIMIT_PER_MINUTE` | no | `0` | Optional per-lease token-bucket rate limit in requests per minute (`0` disables). Denied requests get `429 rate_limited` with `Retry-After` without consuming quota |
+| `KEYLEASE_CIRCUIT_BREAKER_THRESHOLD` | no | `5` | Consecutive upstream failures before the circuit opens and fails fast with `503 upstream_unavailable` without consuming quota (`0` disables) |
+| `KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS` | no | `30000` | Circuit breaker cooldown in milliseconds before probing upstream recovery (half-open state) |
 | `KEYLEASE_FORWARD_AUTH` | no | `false` | Forward the caller's bearer token upstream |
 | `KEYLEASE_METRICS_ENABLED` | no | `false` | Expose Prometheus metrics on `/metrics` |
 | `KEYLEASE_SHUTDOWN_TIMEOUT_MS` | no | `10000` | Graceful shutdown drain timeout in milliseconds |
@@ -516,8 +520,11 @@ The on-chain quota sink tracks at most 10,000 distinct leases in its pending bat
 | `200` | Health check (`/healthz`) or readiness probe (`/readyz`) |
 | `401 missing_token` / `invalid_token` / `token_expired` | Bearer token absent, malformed, forged or expired |
 | `403 lease_not_found` / `lease_inactive` / `lease_expired` / `consumer_mismatch` | On-chain lease does not permit this call |
+| `403 lease_service_mismatch` | Lease was issued for a different service than the configured `KEYLEASE_SERVICE_ID` |
 | `403 quota_exhausted` | The lease's call limit has been spent (on chain, locally, or both) |
+| `429 rate_limited` | Per-lease token bucket rate limit exceeded. Includes `Retry-After` header indicating wait seconds until refill; quota is untouched |
 | `503 verification_unavailable` | Soroban RPC could not be reached (fail closed) or `/readyz` has no reachable state. Includes `Retry-After`, rounded up from the configured cache TTL and capped at 30 seconds |
+| `503 upstream_unavailable` | Upstream circuit breaker is open due to consecutive failures. Fails fast with `Retry-After` without consuming lease quota |
 | `426 upgrade_required` | `Connection: upgrade` requests (e.g. WebSocket) are not supported; rejected before verification, so no call is consumed. The response carries `Upgrade: HTTP/1.1` |
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed) |
 

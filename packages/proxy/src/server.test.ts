@@ -1277,3 +1277,229 @@ describe('buildUpstreamHeaders property test (request-smuggling vectors)', () =>
     expect([a(), a(), a()]).toEqual([b(), b(), b()]);
   });
 });
+
+describe('upstream circuit breaker', () => {
+  it('opens circuit at failure threshold and fails fast with 503 without consuming quota', async () => {
+    let now = NOW * 1000;
+    const clock = () => now;
+
+    let shouldFail = true;
+    const { impl, calls } = stubFetch(() => {
+      if (shouldFail) {
+        throw new Error('ECONNREFUSED');
+      }
+      return okJson({ ok: true });
+    });
+
+    const getLeaseState = vi.fn(async () => leaseState({ callsLimit: 10 }));
+    const verifier = new LeaseVerifier({ provider: { getLeaseState }, clock });
+
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier,
+      fetchImpl: impl,
+      circuitBreakerThreshold: 2,
+      circuitBreakerCooldownMs: 10_000,
+      clock,
+    });
+
+    const token = mintToken();
+
+    // Request 1: upstream failure 1
+    const res1 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res1.statusCode).toBe(502);
+    expect(verifier.localCalls('lease-1')).toBe(1);
+
+    // Request 2: upstream failure 2 -> reaches threshold, circuit opens!
+    const res2 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res2.statusCode).toBe(502);
+    expect(verifier.localCalls('lease-1')).toBe(2);
+
+    // Request 3: circuit is OPEN. Must fail fast with 503 upstream_unavailable
+    // and must NOT consume quota!
+    const res3 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res3.statusCode).toBe(503);
+    expect(res3.headers['retry-after']).toBeDefined();
+    expect(res3.json()).toMatchObject({ error: 'upstream_unavailable' });
+    // Local calls unchanged at 2! Quota untouched!
+    expect(verifier.localCalls('lease-1')).toBe(2);
+    // Fetch was NOT called for request 3!
+    expect(calls).toHaveLength(2);
+
+    // Advance clock past cooldown (10s) -> circuit becomes half-open
+    now += 15_000;
+    shouldFail = false; // upstream recovered
+
+    // Request 4: half-open probe succeeds and closes the circuit
+    const res4 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res4.statusCode).toBe(200);
+    expect(calls).toHaveLength(3);
+    expect(verifier.localCalls('lease-1')).toBe(3);
+
+    // Request 5: circuit is closed, works normally
+    const res5 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res5.statusCode).toBe(200);
+    expect(calls).toHaveLength(4);
+    expect(verifier.localCalls('lease-1')).toBe(4);
+
+    await app.close();
+  });
+
+  it('half-open probe failure re-opens circuit', async () => {
+    let now = NOW * 1000;
+    const clock = () => now;
+
+    const { impl } = stubFetch(() => {
+      throw new Error('ECONNREFUSED');
+    });
+
+    const verifier = new LeaseVerifier({
+      provider: { getLeaseState: async () => leaseState({ callsLimit: 10 }) },
+      clock,
+    });
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier,
+      fetchImpl: impl,
+      circuitBreakerThreshold: 1,
+      circuitBreakerCooldownMs: 5_000,
+      clock,
+    });
+
+    const token = mintToken();
+
+    // Request 1: fails and immediately opens circuit (threshold = 1)
+    const res1 = await app.inject({
+      method: 'GET',
+      url: '/v1/test',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res1.statusCode).toBe(502);
+
+    // Request 2: open -> 503
+    const res2 = await app.inject({
+      method: 'GET',
+      url: '/v1/test',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res2.statusCode).toBe(503);
+
+    // Advance clock into half-open
+    now += 6_000;
+
+    // Request 3: probe fails -> re-opens
+    const res3 = await app.inject({
+      method: 'GET',
+      url: '/v1/test',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res3.statusCode).toBe(502);
+
+    // Request 4: circuit is open again
+    const res4 = await app.inject({
+      method: 'GET',
+      url: '/v1/test',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res4.statusCode).toBe(503);
+
+    await app.close();
+  });
+});
+
+describe('rate limit integration (429 Retry-After)', () => {
+  it('returns 429 with Retry-After header and leaves quota untouched', async () => {
+    const now = NOW * 1000;
+    const clock = () => now;
+    const { impl } = stubFetch(() => okJson({ ok: true }));
+
+    const verifier = new LeaseVerifier({
+      provider: { getLeaseState: async () => leaseState({ callsLimit: 10 }) },
+      rateLimitPerMinute: 1,
+      clock,
+    });
+
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier,
+      fetchImpl: impl,
+      clock,
+    });
+
+    const token = mintToken();
+
+    // 1st request: allowed
+    const res1 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res1.statusCode).toBe(200);
+    expect(verifier.localCalls('lease-1')).toBe(1);
+
+    // 2nd request: 429 rate limited
+    const res2 = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res2.statusCode).toBe(429);
+    expect(res2.headers['retry-after']).toBeDefined();
+    expect(Number(res2.headers['retry-after'])).toBeGreaterThanOrEqual(1);
+    expect(res2.json()).toMatchObject({ error: 'rate_limited' });
+    // Quota remains 1
+    expect(verifier.localCalls('lease-1')).toBe(1);
+
+    await app.close();
+  });
+});
+
+describe('resolveConfig for rate limit, service id, and circuit breaker', () => {
+  const baseEnv = { KEYLEASE_UPSTREAM_URL: 'https://api.example.com' };
+
+  it('parses valid KEYLEASE_RATE_LIMIT_PER_MINUTE', () => {
+    expect(resolveConfig(baseEnv).rateLimitPerMinute).toBe(0);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_RATE_LIMIT_PER_MINUTE: '0' }).rateLimitPerMinute).toBe(0);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_RATE_LIMIT_PER_MINUTE: '60' }).rateLimitPerMinute).toBe(60);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_RATE_LIMIT_PER_MINUTE: '-5' })).toThrow(ProxyConfigError);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_RATE_LIMIT_PER_MINUTE: 'invalid' })).toThrow(ProxyConfigError);
+  });
+
+  it('parses KEYLEASE_SERVICE_ID', () => {
+    expect(resolveConfig(baseEnv).serviceId).toBeUndefined();
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_SERVICE_ID: ' weather-api ' }).serviceId).toBe('weather-api');
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_SERVICE_ID: '' }).serviceId).toBeUndefined();
+  });
+
+  it('parses KEYLEASE_CIRCUIT_BREAKER_THRESHOLD and KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS', () => {
+    expect(resolveConfig(baseEnv).circuitBreakerThreshold).toBe(5);
+    expect(resolveConfig(baseEnv).circuitBreakerCooldownMs).toBe(30_000);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_THRESHOLD: '10' }).circuitBreakerThreshold).toBe(10);
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_THRESHOLD: '0' }).circuitBreakerThreshold).toBe(0);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_THRESHOLD: '-1' })).toThrow(ProxyConfigError);
+
+    expect(resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS: '5000' }).circuitBreakerCooldownMs).toBe(5000);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS: '0' })).toThrow(ProxyConfigError);
+    expect(() => resolveConfig({ ...baseEnv, KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS: '-10' })).toThrow(ProxyConfigError);
+  });
+});

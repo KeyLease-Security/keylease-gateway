@@ -8,6 +8,12 @@
  *
  * On top of that this verifier keeps the *local* call counter: each allowed
  * request increments it, and a lease is refused once its quota is spent.
+ *
+ * LRU counter eviction invariant: Local counters must never drop uncommitted
+ * quota. When maxCounters is reached, pending quota is flushed through the
+ * quotaSink and the evicted lease's cached state is invalidated before
+ * removing the local counter, ensuring on-chain calls_used reflects all
+ * served traffic and prevents double-spending quota.
  */
 import { TokenVerificationError, verifySessionToken, type SessionTokenPayload } from '@keylease/cli/token';
 import { LeaseNotFoundError, type LeaseState } from '@keylease/cli/soroban';
@@ -29,7 +35,9 @@ export type FailureReason =
   | 'lease_inactive'
   | 'lease_expired'
   | 'consumer_mismatch'
-  | 'quota_exhausted';
+  | 'quota_exhausted'
+  | 'lease_service_mismatch'
+  | 'rate_limited';
 
 export type VerificationResult =
   | {
@@ -41,9 +49,10 @@ export type VerificationResult =
     }
   | {
       ok: false;
-      status: 401 | 403 | 503;
+      status: 401 | 403 | 429 | 503;
       reason: FailureReason;
       message: string;
+      retryAfter?: number;
     };
 
 export interface VerifierOptions {
@@ -64,6 +73,14 @@ export interface VerifierOptions {
    * for a `use_call` commit so `calls_used` on chain tracks real traffic.
    */
   quotaSink?: QuotaSink;
+  /**
+   * Optional service binding: when set, incoming leases must match this service ID.
+   */
+  serviceId?: string;
+  /**
+   * Optional per-lease rate limit in requests per minute (0 = disabled).
+   */
+  rateLimitPerMinute?: number;
 }
 
 export interface VerifierStats {
@@ -88,6 +105,12 @@ function nowSeconds(clock: () => number): number {
   return Math.floor(clock() / 1000);
 }
 
+interface TokenBucket {
+  tokens: number;
+  lastRefillMs: number;
+  lastAccessMs: number;
+}
+
 export class LeaseVerifier {
   private readonly provider: LeaseStateProvider;
   private readonly cache: TtlCache<LeaseState>;
@@ -97,17 +120,22 @@ export class LeaseVerifier {
    */
   private readonly denialCache: TtlCache<true>;
   readonly cacheTtlMs: number;
+  readonly serviceId?: string | undefined;
+  readonly rateLimitPerMinute: number;
   private readonly clock: () => number;
   private readonly maxCounters: number;
   private readonly quotaSink: QuotaSink | undefined;
   private readonly calls = new Map<string, number>();
   private readonly inFlight = new Map<string, Promise<LeaseState>>();
+  private readonly rateLimitBuckets = new Map<string, TokenBucket>();
   private rpcCalls = 0;
   private rpcDown = false;
 
   constructor(options: VerifierOptions) {
     this.provider = options.provider;
     this.cacheTtlMs = options.cacheTtlMs ?? DEFAULT_TTL_MS;
+    this.serviceId = options.serviceId;
+    this.rateLimitPerMinute = Math.max(0, options.rateLimitPerMinute ?? 0);
     this.cache =
       options.cache ??
       new TtlCache<LeaseState>({
@@ -185,6 +213,15 @@ export class LeaseVerifier {
       };
     }
 
+    if (this.serviceId !== undefined && lease.service !== this.serviceId) {
+      return {
+        ok: false,
+        status: 403,
+        reason: 'lease_service_mismatch',
+        message: `lease is for service "${lease.service}", expected "${this.serviceId}"`,
+      };
+    }
+
     if (payload.consumer !== lease.consumer) {
       return {
         ok: false,
@@ -221,7 +258,20 @@ export class LeaseVerifier {
       };
     }
 
-    this.consume(lease.leaseId, used + 1);
+    if (this.rateLimitPerMinute > 0) {
+      const rateCheck = this.checkRateLimit(lease.leaseId);
+      if (!rateCheck.allowed) {
+        return {
+          ok: false,
+          status: 429,
+          reason: 'rate_limited',
+          message: `rate limit of ${this.rateLimitPerMinute} req/min exceeded for lease ${lease.leaseId}`,
+          retryAfter: rateCheck.retryAfter,
+        };
+      }
+    }
+
+    await this.consume(lease.leaseId, used + 1);
     this.quotaSink?.record(lease.leaseId);
     return { ok: true, lease, payload, remainingCalls: limit - used - 1 };
   }
@@ -236,9 +286,11 @@ export class LeaseVerifier {
     if (leaseId === undefined) {
       this.calls.clear();
       this.inFlight.clear();
+      this.rateLimitBuckets.clear();
     } else {
       this.calls.delete(leaseId);
-      this.inFlight.delete(leaseId);
+      this.inFlight.delete(this.cacheKey(leaseId));
+      this.rateLimitBuckets.delete(leaseId);
     }
   }
 
@@ -261,15 +313,60 @@ export class LeaseVerifier {
     return this.cache.size > 0 && !this.rpcDown;
   }
 
+  private cacheKey(leaseId: string): string {
+    return this.serviceId !== undefined ? `${this.serviceId}:${leaseId}` : leaseId;
+  }
+
+  private checkRateLimit(leaseId: string): { allowed: true } | { allowed: false; retryAfter: number } {
+    const now = this.clock();
+    let bucket = this.rateLimitBuckets.get(leaseId);
+    if (!bucket) {
+      bucket = {
+        tokens: this.rateLimitPerMinute,
+        lastRefillMs: now,
+        lastAccessMs: now,
+      };
+      this.rateLimitBuckets.set(leaseId, bucket);
+    } else {
+      const elapsedMs = Math.max(0, now - bucket.lastRefillMs);
+      const addedTokens = (elapsedMs * this.rateLimitPerMinute) / 60_000;
+      bucket.tokens = Math.min(this.rateLimitPerMinute, bucket.tokens + addedTokens);
+      bucket.lastRefillMs = now;
+      bucket.lastAccessMs = now;
+    }
+
+    this.pruneIdleBuckets(now);
+
+    if (bucket.tokens >= 1) {
+      bucket.tokens -= 1;
+      return { allowed: true };
+    }
+
+    const needed = 1 - bucket.tokens;
+    const msUntilRefill = (needed * 60_000) / this.rateLimitPerMinute;
+    const retryAfter = Math.max(1, Math.ceil(msUntilRefill / 1_000));
+    return { allowed: false, retryAfter };
+  }
+
+  private pruneIdleBuckets(now: number): void {
+    if (this.rateLimitBuckets.size < 10) return;
+    for (const [id, b] of this.rateLimitBuckets.entries()) {
+      if (now - b.lastAccessMs >= 60_000) {
+        this.rateLimitBuckets.delete(id);
+      }
+    }
+  }
+
   private async resolveLease(leaseId: string): Promise<LeaseState> {
-    const cached = this.cache.get(leaseId);
+    const key = this.cacheKey(leaseId);
+    const cached = this.cache.get(key);
     if (cached !== undefined) return cached;
 
-    if (this.denialCache.get(leaseId) !== undefined) {
+    if (this.denialCache.get(key) !== undefined) {
       throw new LeaseNotFoundError(leaseId);
     }
 
-    const inFlightPromise = this.inFlight.get(leaseId);
+    const inFlightPromise = this.inFlight.get(key);
     if (inFlightPromise !== undefined) {
       return inFlightPromise;
     }
@@ -281,28 +378,35 @@ export class LeaseVerifier {
         this.rpcDown = false;
         // Never cache past the lease's own expiry; non-positive TTLs are not cached.
         const untilExpiryMs = lease.expiresAt * 1000 - this.clock();
-        this.cache.set(leaseId, lease, Math.min(this.cacheTtlMs, untilExpiryMs));
+        this.cache.set(key, lease, Math.min(this.cacheTtlMs, untilExpiryMs));
         return lease;
       } catch (error) {
         if (isLeaseNotFound(error)) {
-          this.denialCache.set(leaseId, true, Math.min(this.cacheTtlMs, 5_000));
+          this.denialCache.set(key, true, Math.min(this.cacheTtlMs, 5_000));
         } else {
           this.rpcDown = true;
         }
         throw error;
       } finally {
-        this.inFlight.delete(leaseId);
+        this.inFlight.delete(key);
       }
     })();
 
-    this.inFlight.set(leaseId, flight);
+    this.inFlight.set(key, flight);
     return flight;
   }
 
-  private consume(leaseId: string, used: number): void {
+  private async consume(leaseId: string, used: number): Promise<void> {
     if (!this.calls.has(leaseId) && this.calls.size >= this.maxCounters) {
-      const oldest = this.calls.keys().next();
-      if (!oldest.done) this.calls.delete(oldest.value);
+      const oldestEntry = this.calls.keys().next();
+      if (!oldestEntry.done) {
+        const oldestId = oldestEntry.value;
+        if (this.quotaSink) {
+          await this.quotaSink.flush();
+          this.cache.delete(this.cacheKey(oldestId));
+          this.calls.delete(oldestId);
+        }
+      }
     }
     this.calls.set(leaseId, used);
   }

@@ -52,6 +52,10 @@ export interface ProxyEnv {
   KEYLEASE_SHUTDOWN_TIMEOUT_MS?: string | undefined;
   KEYLEASE_MAX_BODY_BYTES?: string | undefined;
   KEYLEASE_MAX_INFLIGHT?: string | undefined;
+  KEYLEASE_SERVICE_ID?: string | undefined;
+  KEYLEASE_RATE_LIMIT_PER_MINUTE?: string | undefined;
+  KEYLEASE_CIRCUIT_BREAKER_THRESHOLD?: string | undefined;
+  KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS?: string | undefined;
   PORT?: string | undefined;
   HOST?: string | undefined;
 }
@@ -77,6 +81,10 @@ export interface ResolvedConfig {
   quotaFlushMs: number;
   maxBodyBytes: number;
   maxInFlight: number;
+  serviceId?: string | undefined;
+  rateLimitPerMinute: number;
+  circuitBreakerThreshold: number;
+  circuitBreakerCooldownMs: number;
 }
 
 export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024; // 32 MiB
@@ -87,6 +95,15 @@ function positiveInt(raw: string | undefined, fallback: number, name: string): n
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
     throw new ProxyConfigError(`${name} "${raw}" must be a positive integer`);
+  }
+  return value;
+}
+
+function nonNegativeInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new ProxyConfigError(`${name} "${raw}" must be a non-negative integer`);
   }
   return value;
 }
@@ -153,6 +170,27 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     );
   }
 
+  const rawServiceId = env.KEYLEASE_SERVICE_ID?.trim();
+  const serviceId = rawServiceId && rawServiceId.length > 0 ? rawServiceId : undefined;
+
+  const rateLimitPerMinute = nonNegativeInt(
+    env.KEYLEASE_RATE_LIMIT_PER_MINUTE,
+    0,
+    'KEYLEASE_RATE_LIMIT_PER_MINUTE',
+  );
+
+  const circuitBreakerThreshold = nonNegativeInt(
+    env.KEYLEASE_CIRCUIT_BREAKER_THRESHOLD,
+    5,
+    'KEYLEASE_CIRCUIT_BREAKER_THRESHOLD',
+  );
+
+  const circuitBreakerCooldownMs = positiveInt(
+    env.KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS,
+    30_000,
+    'KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS',
+  );
+
   return {
     upstream,
     host: env.HOST ?? '0.0.0.0',
@@ -171,6 +209,10 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     quotaFlushMs: positiveInt(env.KEYLEASE_QUOTA_FLUSH_MS, 10_000, 'KEYLEASE_QUOTA_FLUSH_MS'),
     maxBodyBytes,
     maxInFlight,
+    serviceId,
+    rateLimitPerMinute,
+    circuitBreakerThreshold,
+    circuitBreakerCooldownMs,
   };
 }
 
@@ -195,6 +237,10 @@ export function describeConfig(config: ResolvedConfig): Record<string, unknown> 
     quotaFlushMs: config.quotaFlushMs,
     maxBodyBytes: config.maxBodyBytes,
     maxInFlight: config.maxInFlight,
+    serviceId: config.serviceId ?? null,
+    rateLimitPerMinute: config.rateLimitPerMinute,
+    circuitBreakerThreshold: config.circuitBreakerThreshold,
+    circuitBreakerCooldownMs: config.circuitBreakerCooldownMs,
   };
 }
 
@@ -298,6 +344,8 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
   const verifier = new LeaseVerifier({
     provider: providerFromClient(client),
     cacheTtlMs: config.cacheTtlMs,
+    serviceId: config.serviceId,
+    rateLimitPerMinute: config.rateLimitPerMinute,
     ...(quotaSink === undefined ? {} : { quotaSink }),
   });
   const app = buildProxyServer({
@@ -308,6 +356,8 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
     metricsEnabled: config.metricsEnabled,
     maxBodyBytes: config.maxBodyBytes,
     maxInFlight: config.maxInFlight,
+    circuitBreakerThreshold: config.circuitBreakerThreshold,
+    circuitBreakerCooldownMs: config.circuitBreakerCooldownMs,
     logger: true,
   });
   app.log.info({ config: describeConfig(config) }, 'configuration');

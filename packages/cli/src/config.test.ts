@@ -44,14 +44,15 @@ function memoryStore(initial: Record<string, LeaseSession> = {}) {
 }
 
 function sessionFor(service: string): LeaseSession {
+  const now = Math.floor(Date.now() / 1000);
   return {
     service,
     leaseId: '42',
     consumer: StrKey.encodeEd25519PublicKey(Buffer.alloc(32, 1)),
     token: 'kls1.payload.signature',
     callsLimit: 5,
-    issuedAt: 1,
-    expiresAt: 2,
+    issuedAt: now - 10,
+    expiresAt: now + 3600,
     txHash: null,
     network: 'testnet',
   };

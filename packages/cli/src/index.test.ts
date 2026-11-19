@@ -219,6 +219,8 @@ describe('parseArgv', () => {
       expect(error.message).toContain(url);
       expect(error.message).toContain('localhost');
     }
+  });
+
   it('parses --dry-run acquire without a secret', () => {
     const invocation = parseArgv([
       'acquire',
