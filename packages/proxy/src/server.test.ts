@@ -6,6 +6,9 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   buildProxyServer,
   buildUpstreamHeaders,
+  copyResponseHeaders,
+  isCorsPreflight,
+  proxyClientErrorHandler,
   resolveUpstreamUrl,
   drainProxyServer,
 } from './server.js';
@@ -451,6 +454,72 @@ describe('proxy routing', () => {
       client.destroy();
       await app.close();
     }
+  });
+
+  it('preserves repeated vary and link headers alongside multiple set-cookie headers', async () => {
+    const headers = new Headers();
+    headers.append('vary', 'Accept-Encoding');
+    headers.append('vary', 'Accept-Language');
+    headers.append('link', '<https://api.example.com/v1?page=2>; rel="next"');
+    headers.append('link', '<https://api.example.com/v1?page=9>; rel="last"');
+    headers.append('set-cookie', 'a=1; Path=/');
+    headers.append('set-cookie', 'b=2; Path=/');
+    const { impl } = stubFetch(async () => new Response('ok', { status: 200, headers }));
+
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(String(res.headers['vary'])).toContain('Accept-Encoding');
+    expect(String(res.headers['vary'])).toContain('Accept-Language');
+    expect(String(res.headers['link'])).toContain('page=2');
+    expect(String(res.headers['link'])).toContain('page=9');
+    const setCookie = res.headers['set-cookie'];
+    const cookies = Array.isArray(setCookie) ? setCookie : [String(setCookie)];
+    expect(cookies.join(' ')).toContain('a=1');
+    expect(cookies.join(' ')).toContain('b=2');
+    await app.close();
+  });
+
+  it('appends repeated header names instead of overwriting them', () => {
+    const written: Record<string, string | string[]> = {};
+    const fakeReply = {
+      header(key: string, value: string) {
+        if (key === 'set-cookie') {
+          const previous = written[key];
+          written[key] =
+            previous === undefined
+              ? [value]
+              : (Array.isArray(previous) ? previous : [previous]).concat(value);
+        } else {
+          written[key] = value;
+        }
+        return fakeReply;
+      },
+    };
+    const repeated = {
+      *[Symbol.iterator]() {
+        yield ['vary', 'Accept-Encoding'] as [string, string];
+        yield ['vary', 'Accept-Language'] as [string, string];
+        yield ['set-cookie', 'a=1'] as [string, string];
+        yield ['set-cookie', 'b=2'] as [string, string];
+      },
+      getSetCookie: () => ['a=1', 'b=2'],
+    } as unknown as Headers;
+
+    copyResponseHeaders(fakeReply as never, repeated);
+
+    expect(written['vary']).toBe('Accept-Encoding, Accept-Language');
+    expect(written['set-cookie']).toEqual(['a=1', 'b=2']);
   });
 
   it('forwards multi-value Set-Cookie headers', async () => {
@@ -1275,5 +1344,191 @@ describe('buildUpstreamHeaders property test (request-smuggling vectors)', () =>
     const a = prng(42);
     const b = prng(42);
     expect([a(), a(), a()]).toEqual([b(), b(), b()]);
+  });
+});
+
+describe('isCorsPreflight', () => {
+  it('requires OPTIONS plus Access-Control-Request-Method', () => {
+    expect(
+      isCorsPreflight({
+        method: 'OPTIONS',
+        headers: { 'access-control-request-method': 'GET' },
+      } as never),
+    ).toBe(true);
+    expect(isCorsPreflight({ method: 'OPTIONS', headers: {} } as never)).toBe(false);
+    expect(
+      isCorsPreflight({
+        method: 'GET',
+        headers: { 'access-control-request-method': 'GET' },
+      } as never),
+    ).toBe(false);
+  });
+});
+
+describe('CORS preflight', () => {
+  function setup(options: Parameters<typeof buildProxyServer>[0]['cors'] = undefined) {
+    const getLeaseState = vi.fn(async () => leaseState());
+    const verifier = makeVerifier({ getLeaseState });
+    const { impl, calls } = stubFetch(() => okJson({ ok: true }));
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier,
+      fetchImpl: impl,
+      ...(options === undefined ? {} : { cors: options }),
+    });
+    return { app, calls, getLeaseState, verifier };
+  }
+
+  it('answers a token-less preflight with 204 and consumes no quota', async () => {
+    const { app, calls, getLeaseState, verifier } = setup();
+    const verifySpy = vi.spyOn(verifier, 'verifyAuthorization');
+
+    const res = await app.inject({
+      method: 'OPTIONS',
+      url: '/v1/weather',
+      headers: {
+        origin: 'https://app.example.com',
+        'access-control-request-method': 'GET',
+        'access-control-request-headers': 'authorization, content-type',
+      },
+    });
+
+    expect(res.statusCode).toBe(204);
+    expect(res.headers['access-control-allow-origin']).toBe('*');
+    expect(res.headers['access-control-allow-methods']).toContain('GET');
+    expect(res.headers['access-control-allow-headers']).toBe(
+      'authorization, content-type, x-request-id',
+    );
+    expect(res.headers['access-control-max-age']).toBe('600');
+    expect(verifySpy).not.toHaveBeenCalled();
+    expect(getLeaseState).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+
+    const next = await app.inject({
+      method: 'GET',
+      url: '/v1/weather',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+    expect(next.headers['x-keylease-calls-remaining']).toBe('9');
+    await app.close();
+  });
+
+  it('answers a preflight that carries a token without charging the lease', async () => {
+    const { app, calls, verifier } = setup({
+      allowedOrigins: ['https://app.example.com'],
+      allowedHeaders: ['authorization', 'content-type'],
+      allowCredentials: true,
+    });
+
+    const res = await app.inject({
+      method: 'OPTIONS',
+      url: '/v1/weather',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        origin: 'https://app.example.com',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'Authorization, Content-Type',
+      },
+    });
+
+    expect(res.statusCode).toBe(204);
+    expect(res.headers['access-control-allow-origin']).toBe('https://app.example.com');
+    expect(res.headers['access-control-allow-credentials']).toBe('true');
+    expect(res.headers['access-control-allow-headers']).toBe('authorization, content-type');
+    expect(String(res.headers['vary'])).toContain('Origin');
+    expect(calls).toHaveLength(0);
+
+    const next = await app.inject({
+      method: 'GET',
+      url: '/v1/weather',
+      headers: {
+        authorization: `Bearer ${mintToken()}`,
+        origin: 'https://app.example.com',
+      },
+    });
+    expect(next.headers['x-keylease-calls-remaining']).toBe('9');
+    expect(next.headers['access-control-allow-origin']).toBe('https://app.example.com');
+    await app.close();
+    expect(verifier.localCalls('lease-1')).toBe(1);
+  });
+
+  it('does not echo the origin when it is outside the allowlist', async () => {
+    const { app } = setup({ allowedOrigins: ['https://allowed.example'] });
+
+    const res = await app.inject({
+      method: 'OPTIONS',
+      url: '/v1/weather',
+      headers: {
+        origin: 'https://evil.example',
+        'access-control-request-method': 'GET',
+      },
+    });
+
+    expect(res.statusCode).toBe(204);
+    expect(res.headers['access-control-allow-origin']).toBeUndefined();
+    await app.close();
+  });
+
+  it('still requires a lease token for a non-preflight OPTIONS request', async () => {
+    const { app, calls } = setup();
+
+    const res = await app.inject({
+      method: 'OPTIONS',
+      url: '/v1/weather',
+      headers: { origin: 'https://app.example.com' },
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toMatchObject({ error: 'missing_token' });
+    expect(calls).toHaveLength(0);
+    await app.close();
+  });
+});
+
+describe('inbound connection timeouts', () => {
+  function setup() {
+    const { impl } = stubFetch(() => okJson({ ok: true }));
+    return buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+      keepAliveTimeoutMs: 5_000,
+      incomingRequestTimeoutMs: 1_000,
+    });
+  }
+
+  it('passes keep-alive and request timeouts to Fastify', async () => {
+    const app = setup();
+    expect(app.server.keepAliveTimeout).toBe(5_000);
+    expect(app.server.requestTimeout).toBe(1_000);
+    await app.close();
+  });
+
+  it('writes a JSON 408 request_timeout when an inbound request times out', () => {
+    const chunks: string[] = [];
+    const socket = {
+      writable: true,
+      destroyed: false,
+      write: (chunk: string) => {
+        chunks.push(chunk);
+        return true;
+      },
+      destroy: () => {
+        socket.destroyed = true;
+      },
+    };
+    const error = Object.assign(new Error('request timeout'), {
+      code: 'ERR_HTTP_REQUEST_TIMEOUT',
+      bytesParsed: 0,
+      rawPacket: { type: 'request', data: [] },
+    });
+
+    proxyClientErrorHandler(error as never, socket as never);
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toContain('HTTP/1.1 408 Request Timeout');
+    expect(chunks[0]).toContain('Content-Type: application/json; charset=utf-8');
+    expect(chunks[0]).toContain('"error":"request_timeout"');
+    expect(socket.destroyed).toBe(true);
   });
 });

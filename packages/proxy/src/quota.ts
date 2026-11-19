@@ -118,10 +118,6 @@ export class OnChainQuota implements QuotaSink {
 
   /** Serialises flushes so two commits never overlap. */
   flush(): Promise<void> {
-    const snapshot = [...this.pending.entries()];
-    if (snapshot.length === 0) return this.queue;
-    this.pending.clear();
-    this.queue = this.queue.then(() => this.drain(snapshot));
     this.clearRetryTimer();
     this.queue = this.queue.then(() => this.drain());
     return this.queue;
@@ -142,7 +138,6 @@ export class OnChainQuota implements QuotaSink {
     return total;
   }
 
-  private async drain(snapshot: Array<[string, number]>): Promise<void> {
   private async drain(): Promise<void> {
     if (this.pending.size === 0) return;
     const snapshot = [...this.pending.entries()];
