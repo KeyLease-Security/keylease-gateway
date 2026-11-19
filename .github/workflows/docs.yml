@@ -1,0 +1,26 @@
+name: Spellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  typos:
+    name: spellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check spelling
+        uses: crate-ci/typos@v1.52.2
+        with:
+          config: ./_typos.toml

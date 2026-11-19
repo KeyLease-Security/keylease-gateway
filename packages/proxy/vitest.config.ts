@@ -23,5 +23,10 @@ export default defineConfig({
     environment: 'node',
     include: ['src/**/*.test.ts'],
     restoreMocks: true,
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'json-summary'],
+      reportsDirectory: 'coverage',
+    },
   },
 });

@@ -126,6 +126,91 @@ sequenceDiagram
 
 ---
 
+## Quota batching and on-chain reconciliation
+
+The proxy has two quota views:
+
+- **Locally observed usage** is maintained in memory by `LeaseVerifier`. Each
+  served, accepted request increments that process's counter immediately.
+- **On-chain committed usage** is maintained by the Soroban contract as
+  `calls_used`. A configured gateway key is required for batched `use_call`
+  commits.
+
+The local counter is the fast path: it admits traffic without waiting for an
+RPC round trip. It is not durable and is not a substitute for the lease's
+on-chain state.
+
+When a gateway secret is configured, the proxy queues one count per lease.
+The queue flushes when the **total pending count across leases reaches 50**,
+after a **10-second interval**, when the tracked-lease bound triggers an early
+flush, or during shutdown's `close()` drain. Operators can override the batch
+size and interval with `KEYLEASE_QUOTA_BATCH` and `KEYLEASE_QUOTA_FLUSH_MS`.
+Each flush snapshots pending counts and issues a separate `use_call(lease_id,
+count)` for each lease. Commits are serialized and are fire-and-forget from
+the client request path: the request has already been admitted and returned
+without waiting for commit success.
+
+If an RPC commit fails, that lease's count is returned to the pending map and
+`onError` logs it. The implementation schedules jittered exponential retry
+backoff (1-second base, 30-second cap by default) and makes at most five total
+commit attempts per pending batch. Later local traffic is added to requeued
+pending usage, so a later successful commit can include both earlier and newly
+observed calls. Repeated failure does not turn local usage into an HTTP 5xx,
+and the on-chain lease remains authoritative for settlement.
+
+There is an explicit crash window: the verifier counter and quota batch map
+live only in process memory. Calls observed since the last successful commit
+can be lost if the process exits unexpectedly or restarts; pending usage is
+not guaranteed to survive. Graceful close attempts to flush remaining counts,
+but a forced process termination or unavailable RPC may leave committed usage
+behind. The new process starts with an empty local counter and reads the
+lease's last committed on-chain state, so a restart may temporarily permit
+usage that is not yet reflected in a newly started or rebuilt counter.
+
+Multiple proxy instances do not share a local counter or in-process retry
+queue. Each instance admits from `max(on-chain calls_used, local_calls)` and
+its own counter only. They can therefore have independent over-admission
+windows and may batch separate `use_call` calls for the same lease. The contract
+receives and applies gateway-authorized commits; concurrent instances are
+not assigned disjoint call ranges. Operators should use the on-chain
+`calls_used` value and reconciliation procedures as the source of truth.
+
+An operator can reconcile usage with `use_call`. This is typically done with
+the gateway account configured for the proxy and the count representing usage
+known to be missing from `calls_used`. Before invoking it, obtain the observed
+request usage and check the lease's on-chain state; avoid resubmitting a batch
+that may already have committed. An already-observed call that was later
+committed by one or more proxies must not be counted twice. The contract's
+settlement calculation uses on-chain `calls_used`, while local counters affect
+only each proxy process's admission decisions until their commits succeed.
+
+```mermaid
+sequenceDiagram
+    participant C as Client/request path
+    participant V as Proxy local quota counter
+    participant B as Batch/flush mechanism
+    participant RPC as Stellar RPC / keylease-core
+
+    C->>V: Accepted verified request
+    V->>V: Increment local lease count
+    V->>B: Record lease call
+    alt total pending reaches batch size or interval expires
+        B->>B: Snapshot pending counts
+        B->>RPC: use_call(lease_id, count)
+        alt commit succeeds
+            RPC-->>B: Success
+            B->>B: Clear retried batch
+        else RPC commit fails
+            RPC-->>B: Error
+            B->>B: Requeue count and schedule bounded jittered retry
+        end
+    else shutdown
+        B->>RPC: Close: flush remaining counts
+    end
+```
+
+---
+
 ## Quickstart
 
 <!-- Generated from scripts/demo/quickstart.sh; placeholder until the GIF is recorded. -->

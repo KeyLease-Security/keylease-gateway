@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -43,7 +46,17 @@ jobs:
         run: pnpm -r typecheck
 
       - name: Test
-        run: pnpm test
+        run: pnpm -r exec vitest run --coverage
+
+      - name: Upload coverage summaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pull-request-coverage
+          path: |
+            packages/*/coverage/coverage-summary.json
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload test output on failure
         if: failure()
@@ -55,6 +68,59 @@ jobs:
             packages/*/dist
           if-no-files-found: ignore
           retention-days: 7
+
+  coverage-comment:
+    name: publish coverage
+    if: github.event_name == 'pull_request'
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout base revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install base dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate base coverage summaries
+        run: pnpm -r exec vitest run --coverage
+
+      - name: Download pull-request coverage summaries
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: pull-request-coverage
+          path: .coverage/pr
+
+      - name: Publish coverage comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -f scripts/coverage-comment.mjs ]; then
+            node scripts/coverage-comment.mjs \
+              --pr-coverage .coverage/pr \
+              --base-coverage packages \
+              --comment
+          else
+            echo "Coverage comment skipped: trusted comment script is not present on the base revision."
+          fi
 
   contract:
     name: contract · test · wasm

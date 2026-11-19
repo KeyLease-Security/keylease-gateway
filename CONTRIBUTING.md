@@ -18,6 +18,9 @@ pnpm test           # vitest (108 tests)
 pnpm lint           # eslint
 pnpm typecheck      # build + tsc --noEmit
 
+# prose and identifiers (typos-cli 1.52.2)
+typos --config _typos.toml
+
 # contract (needs Rust + stellar-cli)
 pnpm contract:test  # cargo test (22 tests)
 pnpm contract:build # stellar contract build -> wasm32v1-none
