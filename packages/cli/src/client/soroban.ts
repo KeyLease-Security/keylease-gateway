@@ -692,6 +692,9 @@ function transactionResultName(result: unknown): string {
  * @throws SorobanError if the URL is invalid or does not meet the scheme requirements
  */
 export function validateRpcUrl(url: string): void {
+  if (!url.includes('://')) {
+    throw new SorobanError(`invalid RPC URL "${url}": must be a valid URL`);
+  }
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -707,7 +710,7 @@ export function validateRpcUrl(url: string): void {
   // Allow http: only for localhost/127.0.0.1
   if (scheme === 'http:') {
     const hostname = parsed.hostname;
-    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1' && hostname !== '[::1]') {
       throw new SorobanError(
         `invalid RPC URL "${url}": http: is only allowed for localhost, not ${hostname}`,
       );

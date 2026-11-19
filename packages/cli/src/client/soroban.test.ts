@@ -9,7 +9,6 @@ import {
   parseLeaseState,
   encodeLeaseState,
   validateRpcUrl,
-  SorobanError,
   type LeaseState,
   type SorobanRpc,
 } from './soroban.js';

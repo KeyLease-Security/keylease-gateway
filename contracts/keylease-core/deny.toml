@@ -1,0 +1,12 @@
+[advisories]
+unmaintained = "all"
+ignore = [
+    # RUSTSEC-2026-0387: Multiple timing variability issues in operations intended to be constant-time in crypto-bigint 0.5.5.
+    # Transitive dependency via soroban-env-host 29.0.1 (elliptic-curve 0.13.8).
+    # Review when soroban-env-host updates past elliptic-curve / crypto-bigint 0.7.
+    "RUSTSEC-2026-0387",
+
+    # RUSTSEC-2024-0436: paste is unmaintained.
+    # Transitive macro dependency via soroban-env-host 29.0.1 (ark-ff, wasmi_core).
+    "RUSTSEC-2024-0436",
+]

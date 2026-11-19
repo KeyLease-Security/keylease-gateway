@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)]
 //! # keylease-core
 //!
 //! Soroban lease registry that backs the KeyLease gateway. Everything a lease
@@ -127,7 +128,9 @@ fn bump_instance_ttl(env: &Env) {
 }
 
 fn bump_persistent_ttl(env: &Env, key: &DataKey) {
-    env.storage().persistent().extend_ttl(key, MIN_TTL, EXTEND_TO);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, MIN_TTL, EXTEND_TO);
 }
 
 fn load_config(env: &Env) -> Result<Config, Error> {
@@ -191,10 +194,8 @@ impl KeyleaseCore {
                 lease_count: 0,
             },
         );
-        env.events().publish(
-            (Symbol::new(&env, "init"), admin),
-            env.ledger().timestamp(),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "init"), admin), env.ledger().timestamp());
         Ok(())
     }
 
@@ -204,8 +205,10 @@ impl KeyleaseCore {
         config.admin.require_auth();
         config.gateway = gateway.clone();
         store_config(&env, &config);
-        env.events()
-            .publish((Symbol::new(&env, "gateway"), gateway), env.ledger().timestamp());
+        env.events().publish(
+            (Symbol::new(&env, "gateway"), gateway),
+            env.ledger().timestamp(),
+        );
         Ok(())
     }
 
@@ -344,11 +347,8 @@ impl KeyleaseCore {
             .checked_mul(calls as i128)
             .ok_or(Error::InvalidAmount)?;
 
-        token::Client::new(&env, &config.token).transfer(
-            &consumer,
-            &env.current_contract_address(),
-            &amount,
-        );
+        let contract_address = env.current_contract_address();
+        token::Client::new(&env, &config.token).transfer(&consumer, &contract_address, &amount);
 
         let id = config.lease_count + 1;
         config.lease_count = id;
@@ -396,11 +396,18 @@ impl KeyleaseCore {
             return Err(Error::LeaseExpired);
         }
 
-        lease.calls_used = lease.calls_used.saturating_add(count).min(lease.calls_limit);
+        lease.calls_used = lease
+            .calls_used
+            .saturating_add(count)
+            .min(lease.calls_limit);
         store_lease(&env, &lease);
         let remaining = lease.calls_limit.saturating_sub(lease.calls_used);
         env.events().publish(
-            (Symbol::new(&env, "calls_committed"), lease.consumer.clone(), lease_id),
+            (
+                Symbol::new(&env, "calls_committed"),
+                lease.consumer.clone(),
+                lease_id,
+            ),
             (lease.calls_used, remaining),
         );
         Ok(lease)
@@ -430,7 +437,11 @@ impl KeyleaseCore {
         lease.settled = true;
         store_lease(&env, &lease);
         env.events().publish(
-            (Symbol::new(&env, "lease_revoked"), lease.consumer.clone(), lease_id),
+            (
+                Symbol::new(&env, "lease_revoked"),
+                lease.consumer.clone(),
+                lease_id,
+            ),
             refund,
         );
         Ok(lease)
@@ -467,7 +478,11 @@ impl KeyleaseCore {
         lease.settled = true;
         store_lease(&env, &lease);
         env.events().publish(
-            (Symbol::new(&env, "lease_settled"), lease.provider.clone(), lease_id),
+            (
+                Symbol::new(&env, "lease_settled"),
+                lease.provider.clone(),
+                lease_id,
+            ),
             (payable, refund),
         );
         Ok(lease)

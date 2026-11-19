@@ -40,7 +40,16 @@ fn setup() -> Harness {
     let client = KeyleaseCoreClient::new(&env, &contract_id);
     client.init(&admin, &token, &gateway);
 
-    Harness { env, contract_id, admin, gateway, consumer, provider, token, client }
+    Harness {
+        env,
+        contract_id,
+        admin,
+        gateway,
+        consumer,
+        provider,
+        token,
+        client,
+    }
 }
 
 fn register(h: &Harness) {
@@ -61,7 +70,10 @@ fn init_is_one_time_and_exposes_config() {
     assert_eq!(config.token, h.token);
     assert_eq!(config.lease_count, 0);
 
-    let err = h.client.try_init(&h.admin, &h.token, &h.gateway).unwrap_err();
+    let err = h
+        .client
+        .try_init(&h.admin, &h.token, &h.gateway)
+        .unwrap_err();
     assert_eq!(err.unwrap(), Error::AlreadyInitialized);
 }
 
@@ -69,7 +81,10 @@ fn init_is_one_time_and_exposes_config() {
 fn version_matches_the_crate_version() {
     let h = setup();
     assert_eq!(CONTRACT_VERSION, env!("CARGO_PKG_VERSION"));
-    assert_eq!(h.client.version(), String::from_str(&h.env, CONTRACT_VERSION));
+    assert_eq!(
+        h.client.version(),
+        String::from_str(&h.env, CONTRACT_VERSION)
+    );
 }
 
 #[test]
@@ -77,7 +92,10 @@ fn version_is_readable_before_init() {
     let env = Env::default();
     let contract_id = env.register(KeyleaseCore, ());
     let client = KeyleaseCoreClient::new(&env, &contract_id);
-    assert_eq!(client.version(), String::from_str(&env, env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        client.version(),
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]
@@ -107,7 +125,10 @@ fn register_service_rejects_non_positive_price() {
         .register_service(&h.provider, &service_id(&h.env), &1_000);
     assert!(svc.active);
     assert_eq!(svc.price_per_call, 1_000);
-    assert_eq!(h.client.get_service(&service_id(&h.env)).provider, h.provider);
+    assert_eq!(
+        h.client.get_service(&service_id(&h.env)).provider,
+        h.provider
+    );
 }
 
 #[test]
@@ -134,7 +155,10 @@ fn quote_rejects_overflowing_totals() {
     // i128::MAX * 2 overflows: checked_mul must surface InvalidAmount, not trap.
     let err = h.client.try_quote(&service_id(&h.env), &2).unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidAmount);
-    let err = h.client.try_quote(&service_id(&h.env), &u32::MAX).unwrap_err();
+    let err = h
+        .client
+        .try_quote(&service_id(&h.env), &u32::MAX)
+        .unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidAmount);
 }
 
@@ -457,10 +481,7 @@ mod unauthorised {
             .try_register_service(&h.provider, &service_id(&h.env), &1_000)
             .unwrap_err();
         assert!(err.is_err(), "a provider signature is required");
-        let err = h
-            .client
-            .try_get_service(&service_id(&h.env))
-            .unwrap_err();
+        let err = h.client.try_get_service(&service_id(&h.env)).unwrap_err();
         assert_eq!(err.unwrap(), Error::UnknownService);
     }
 
@@ -592,7 +613,10 @@ fn proposing_a_new_admin_requires_the_current_admin() {
     let next = Address::generate(&h.env);
     h.env.mock_auths(&[]);
     let err = h.client.try_propose_admin(&next).unwrap_err();
-    assert!(err.is_err(), "only the current admin may propose a successor");
+    assert!(
+        err.is_err(),
+        "only the current admin may propose a successor"
+    );
     assert_eq!(h.client.get_config().admin, h.admin);
 }
 
@@ -680,7 +704,11 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(h.client.address.clone(), topics(), (3u32, 7u32).into_val(&h.env))],
+            [(
+                h.client.address.clone(),
+                topics(),
+                (3u32, 7u32).into_val(&h.env)
+            )],
         ),
     );
 
@@ -690,7 +718,11 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(h.client.address.clone(), topics(), (10u32, 0u32).into_val(&h.env))],
+            [(
+                h.client.address.clone(),
+                topics(),
+                (10u32, 0u32).into_val(&h.env)
+            )],
         ),
     );
 }
@@ -708,4 +740,43 @@ fn escrow_survives_many_leases() {
         total += 10_000;
     }
     assert_eq!(balance(&h, &h.client.address), total);
+}
+
+#[test]
+fn pause_service_allows_existing_lease_lifecycle_but_blocks_new_leases() {
+    let h = setup();
+    register(&h);
+    let service = service_id(&h.env);
+
+    // Lease 1 will be used and settled
+    let lease_1 = h.client.create_lease(&h.consumer, &service, &10, &3_600);
+
+    // Lease 2 will be revoked
+    let lease_2 = h.client.create_lease(&h.consumer, &service, &10, &3_600);
+
+    // Deactivate the service
+    h.client.set_service_active(&h.provider, &service, &false);
+    assert!(!h.client.get_service(&service).active);
+
+    // Assert that new lease creation is blocked with ServiceInactive
+    let err = h
+        .client
+        .try_create_lease(&h.consumer, &service, &5, &3_600)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::ServiceInactive);
+
+    // Assert existing lease_1 can still commit calls
+    h.client.use_call(&lease_1, &4);
+    assert_eq!(h.client.remaining_calls(&lease_1), 6);
+
+    // Assert existing lease_2 can still be revoked by consumer
+    h.client.revoke(&lease_2);
+    let lease_2_state = h.client.get_lease(&lease_2);
+    assert!(lease_2_state.settled);
+
+    // Assert existing lease_1 can still be settled after quota exhaustion
+    h.client.use_call(&lease_1, &6); // total 10 calls used, quota exhausted
+    h.client.settle(&lease_1);
+    let lease_1_state = h.client.get_lease(&lease_1);
+    assert!(lease_1_state.settled);
 }

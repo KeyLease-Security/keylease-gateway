@@ -182,3 +182,45 @@ the expected failure mode.
   bodies, status codes).
 - Keep tests deterministic: inject a fake `clock`, a fake `SorobanRpc` and a
   fake committer instead of sleeping or hitting the network.
+
+## Linting, formatting, and security checks
+
+### Contract formatting and clippy
+
+CI enforces formatting and strict clippy lints on `contracts/keylease-core`:
+
+```bash
+# Verify formatting
+cargo fmt --manifest-path contracts/keylease-core/Cargo.toml --check
+
+# Run clippy with warnings denied
+cargo clippy --manifest-path contracts/keylease-core/Cargo.toml --all-targets -- -D warnings
+
+# Auto-format
+cargo fmt --manifest-path contracts/keylease-core/Cargo.toml
+```
+
+### GitHub Actions workflow linting (actionlint)
+
+Workflow files in `.github/workflows/` are linted using `actionlint` with `shellcheck`:
+
+```bash
+# Run actionlint locally across all workflow files
+actionlint
+```
+
+You can download pinned actionlint binaries from [actionlint releases](https://github.com/rhysd/actionlint/releases).
+
+### Rust dependency advisory audit (cargo-deny)
+
+Contract dependencies are audited for known security advisories via `cargo-deny`:
+
+```bash
+cargo deny --manifest-path contracts/keylease-core/Cargo.toml --config contracts/keylease-core/deny.toml check advisories
+```
+
+#### Triage process for new advisories
+
+1. Check if the advisory affects direct code or can be resolved by upgrading: run `cargo update -p <crate>` inside `contracts/keylease-core` and execute all contract tests (`cargo test`).
+2. If the advisory comes from a transitive dependency of `soroban-env-host` or `soroban-sdk` that cannot yet be upgraded upstream, evaluate whether the vulnerable functionality is reachable within the Soroban contract environment.
+3. If unreachable or an accepted risk pending upstream release, record an entry in `contracts/keylease-core/deny.toml` under `[advisories.ignore]` documenting the rationale, affected dependency path, and review condition.

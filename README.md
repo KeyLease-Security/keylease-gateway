@@ -434,7 +434,7 @@ An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 | `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
 | `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
 | `register_service(provider, service, price_per_call)` | provider | Register or re-price a service (`price_per_call > 0`) |
-| `set_service_active(provider, service, active)` | provider | Pause / resume a service |
+| `set_service_active(provider, service, active)` | provider | Pause / resume a service. Pausing blocks new leases (`create_lease`); existing active leases can continue to commit calls (`use_call`), revoke (`revoke`), and settle (`settle`) |
 | `quote(service, calls)` | – | Price of a batch in token smallest units |
 | `create_lease(consumer, service, calls, duration)` | consumer | Pulls `calls × price_per_call` into escrow, returns `u64` lease id. `consumer` must not be the contract itself |
 | `use_call(lease_id, count)` | gateway | Commits served calls (clamped at `calls_limit`); emits `calls_committed` with `(calls_used, remaining)` |

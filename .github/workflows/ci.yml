@@ -140,11 +140,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32v1-none
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts/keylease-core
+
+      - name: Cargo fmt check
+        run: cargo fmt --manifest-path contracts/keylease-core/Cargo.toml --check
+
+      - name: Cargo clippy
+        run: cargo clippy --manifest-path contracts/keylease-core/Cargo.toml --all-targets -- -D warnings
 
       # soroban-sdk 29 requires stellar-cli to produce a deployable wasm
       - name: Install stellar-cli
@@ -168,3 +175,24 @@ jobs:
           path: contracts/keylease-core/target/wasm32v1-none/release/keylease_core.wasm
           if-no-files-found: error
           retention-days: 30
+
+  actionlint:
+    name: workflows · actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.7"
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" | tar -xz -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Run actionlint
+        run: actionlint
