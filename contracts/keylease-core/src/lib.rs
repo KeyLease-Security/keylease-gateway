@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)]
 //! # keylease-core
 //!
 //! Soroban lease registry that backs the KeyLease gateway. Everything a lease
@@ -39,6 +40,9 @@ const MIN_TTL: u32 = DAY_IN_LEDGERS * 7;
 /// Extend it to a month.
 const EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 
+/// Maximum number of leases that may be settled in a single `settle_many` call.
+pub const MAX_SETTLE_BATCH: u32 = 50;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -59,6 +63,8 @@ pub enum Error {
     Unauthorized = 14,
     /// `create_lease` was called with the contract itself as consumer.
     InvalidConsumer = 15,
+    /// `settle_many` was called with more IDs than `MAX_SETTLE_BATCH`.
+    BatchTooLarge = 16,
 }
 
 #[contracttype]
@@ -80,6 +86,8 @@ pub struct Service {
     /// Price of a single API call, in token smallest units.
     pub price_per_call: i128,
     pub active: bool,
+    /// Number of leases ever created for this service.
+    pub lease_count: u64,
 }
 
 #[contracttype]
@@ -127,7 +135,9 @@ fn bump_instance_ttl(env: &Env) {
 }
 
 fn bump_persistent_ttl(env: &Env, key: &DataKey) {
-    env.storage().persistent().extend_ttl(key, MIN_TTL, EXTEND_TO);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, MIN_TTL, EXTEND_TO);
 }
 
 fn load_config(env: &Env) -> Result<Config, Error> {
@@ -191,10 +201,8 @@ impl KeyleaseCore {
                 lease_count: 0,
             },
         );
-        env.events().publish(
-            (Symbol::new(&env, "init"), admin),
-            env.ledger().timestamp(),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "init"), admin), env.ledger().timestamp());
         Ok(())
     }
 
@@ -204,8 +212,10 @@ impl KeyleaseCore {
         config.admin.require_auth();
         config.gateway = gateway.clone();
         store_config(&env, &config);
-        env.events()
-            .publish((Symbol::new(&env, "gateway"), gateway), env.ledger().timestamp());
+        env.events().publish(
+            (Symbol::new(&env, "gateway"), gateway),
+            env.ledger().timestamp(),
+        );
         Ok(())
     }
 
@@ -259,13 +269,16 @@ impl KeyleaseCore {
         if price_per_call <= 0 {
             return Err(Error::InvalidPrice);
         }
+        let key = DataKey::Service(service.clone());
+        let existing = env.storage().persistent().get::<_, Service>(&key);
+        let lease_count = existing.map(|s| s.lease_count).unwrap_or(0);
         let stored = Service {
             provider: provider.clone(),
             service: service.clone(),
             price_per_call,
             active: true,
+            lease_count,
         };
-        let key = DataKey::Service(service.clone());
         env.storage().persistent().set(&key, &stored);
         bump_persistent_ttl(&env, &key);
         env.events().publish(
@@ -282,6 +295,7 @@ impl KeyleaseCore {
         service: soroban_sdk::String,
         active: bool,
     ) -> Result<Service, Error> {
+        load_config(&env)?;
         provider.require_auth();
         let mut stored = load_service(&env, &service)?;
         if stored.provider != provider {
@@ -334,21 +348,22 @@ impl KeyleaseCore {
         }
 
         let mut config = load_config(&env)?;
-        let stored = load_service(&env, &service)?;
+        let mut stored = load_service(&env, &service)?;
         if !stored.active {
             return Err(Error::ServiceInactive);
         }
+        stored.lease_count = stored.lease_count.saturating_add(1);
+        let service_key = DataKey::Service(service.clone());
+        env.storage().persistent().set(&service_key, &stored);
+        bump_persistent_ttl(&env, &service_key);
 
         let amount = stored
             .price_per_call
             .checked_mul(calls as i128)
             .ok_or(Error::InvalidAmount)?;
 
-        token::Client::new(&env, &config.token).transfer(
-            &consumer,
-            &env.current_contract_address(),
-            &amount,
-        );
+        let contract_address = env.current_contract_address();
+        token::Client::new(&env, &config.token).transfer(&consumer, &contract_address, &amount);
 
         let id = config.lease_count + 1;
         config.lease_count = id;
@@ -396,11 +411,18 @@ impl KeyleaseCore {
             return Err(Error::LeaseExpired);
         }
 
-        lease.calls_used = lease.calls_used.saturating_add(count).min(lease.calls_limit);
+        lease.calls_used = lease
+            .calls_used
+            .saturating_add(count)
+            .min(lease.calls_limit);
         store_lease(&env, &lease);
         let remaining = lease.calls_limit.saturating_sub(lease.calls_used);
         env.events().publish(
-            (Symbol::new(&env, "calls_committed"), lease.consumer.clone(), lease_id),
+            (
+                Symbol::new(&env, "calls_committed"),
+                lease.consumer.clone(),
+                lease_id,
+            ),
             (lease.calls_used, remaining),
         );
         Ok(lease)
@@ -419,8 +441,9 @@ impl KeyleaseCore {
             / (lease.calls_limit as i128);
 
         if refund > 0 {
+            let contract_address = env.current_contract_address();
             token::Client::new(&env, &config.token).transfer(
-                &env.current_contract_address(),
+                &contract_address,
                 &lease.consumer,
                 &refund,
             );
@@ -430,7 +453,11 @@ impl KeyleaseCore {
         lease.settled = true;
         store_lease(&env, &lease);
         env.events().publish(
-            (Symbol::new(&env, "lease_revoked"), lease.consumer.clone(), lease_id),
+            (
+                Symbol::new(&env, "lease_revoked"),
+                lease.consumer.clone(),
+                lease_id,
+            ),
             refund,
         );
         Ok(lease)
@@ -467,10 +494,35 @@ impl KeyleaseCore {
         lease.settled = true;
         store_lease(&env, &lease);
         env.events().publish(
-            (Symbol::new(&env, "lease_settled"), lease.provider.clone(), lease_id),
+            (
+                Symbol::new(&env, "lease_settled"),
+                lease.provider.clone(),
+                lease_id,
+            ),
             (payable, refund),
         );
         Ok(lease)
+    }
+
+    /// Permissionless: settle a batch of expired or exhausted leases.
+    ///
+    /// Bounded by `MAX_SETTLE_BATCH = 50`. Returns a list of settled leases.
+    /// Leases that are not yet settleable (active and unexpired) or already
+    /// settled are skipped so valid settlements in the batch still succeed.
+    pub fn settle_many(
+        env: Env,
+        ids: soroban_sdk::Vec<u64>,
+    ) -> Result<soroban_sdk::Vec<Lease>, Error> {
+        if ids.len() > MAX_SETTLE_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+        let mut settled = soroban_sdk::Vec::new(&env);
+        for id in ids.iter() {
+            if let Ok(lease) = Self::settle(env.clone(), id) {
+                settled.push_back(lease);
+            }
+        }
+        Ok(settled)
     }
 
     /// Live lease state.

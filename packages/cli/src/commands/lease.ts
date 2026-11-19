@@ -281,7 +281,6 @@ export function selectLease(
  * File permissions:
  *   Created with mode 0o600 (owner read/write only) to protect sensitive tokens.
  */
-export function fileSessionStore(cwd: string = process.cwd()): SessionStore {
 /**
  * File-backed store, one JSON document keyed by service id.
  *
@@ -322,7 +321,7 @@ export function fileSessionStore(
     return run;
   }
 
-  const writeSessions = (sessions: Record<string, LeaseSession>): Promise<void> =>
+  const writeSessions = (sessions: Record<string, LeaseSession[]>): Promise<void> =>
     writeAtomic(path, `${JSON.stringify(sessions, null, 2)}\n`);
 
   return {
@@ -349,43 +348,31 @@ export function fileSessionStore(
       return sessions;
     },
     async save(session: LeaseSession): Promise<void> {
-      let sessions: Record<string, LeaseSession[]>;
-      try {
-        sessions = await this.load();
-      } catch (error) {
-        if (!(error instanceof SessionStoreError) || error.code !== 'missing') throw error;
-        sessions = {};
-      }
-
-      // Add or update lease in array (idempotent: replace if same leaseId exists)
-      if (!sessions[session.service]) {
-        sessions[session.service] = [];
-      }
-      const idx = sessions[session.service].findIndex((s) => s.leaseId === session.leaseId);
-      if (idx >= 0) {
-        sessions[session.service][idx] = session;
-      } else {
-        sessions[session.service].push(session);
-      }
-
-      await this.saveAll(sessions);
-    },
-    async saveAll(sessions: Record<string, LeaseSession[]>): Promise<void> {
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, `${JSON.stringify(sessions, null, 2)}\n`, { mode: 0o600 });
       await exclusive(async () => {
-        let sessions: Record<string, LeaseSession>;
+        let sessions: Record<string, LeaseSession[]>;
         try {
           sessions = await this.load();
         } catch (error) {
           if (!(error instanceof SessionStoreError) || error.code !== 'missing') throw error;
           sessions = {};
         }
-        sessions[session.service] = session;
+
+        // Add or update lease in array (idempotent: replace if same leaseId exists)
+        if (!sessions[session.service]) {
+          sessions[session.service] = [];
+        }
+        const list = sessions[session.service]!;
+        const idx = list.findIndex((s) => s.leaseId === session.leaseId);
+        if (idx >= 0) {
+          list[idx] = session;
+        } else {
+          list.push(session);
+        }
+
         await writeSessions(sessions);
       });
     },
-    async saveAll(sessions: Record<string, LeaseSession>): Promise<void> {
+    async saveAll(sessions: Record<string, LeaseSession[]>): Promise<void> {
       await exclusive(() => writeSessions(sessions));
     },
   };
@@ -598,10 +585,12 @@ export function mergeEnv(existing: string, entries: Record<string, string>): str
     if (!match) return line;
     const exportPrefix = match[1] ?? '';
     const key = match[2] as string;
+    const rawVal = match[3] ?? '';
     if (key in entries && !emitted.has(key)) {
       emitted.add(key);
-      return `${exportPrefix}${key}=${entries[key]}`;
-      return `${key}=${quoteEnvValue(entries[key] as string)}`;
+      const commentMatch = /\s+(#.*)$/.exec(rawVal);
+      const comment = commentMatch ? ` ${commentMatch[1]}` : '';
+      return `${exportPrefix}${key}=${quoteEnvValue(entries[key] as string)}${comment}`;
     }
     if (key in entries) return null; // drop duplicates
     return line;
@@ -639,9 +628,11 @@ export async function envCommand(
   const read = deps.readFile ?? ((path: string) => readFile(path, 'utf8'));
   const write =
     deps.writeFile ?? ((path: string, contents: string) => writeFile(path, contents, { mode: 0o600 }));
-  const now = deps.now ?? (() => Math.floor(Date.now() / 1000));
+  const now = deps.now ?? (() => Date.now());
+  const currentSeconds = Math.floor(now() > 1e11 ? now() / 1000 : now());
 
-  const allSessions = await store.load();
+  const rawSessions = await store.load();
+  const allSessions = migrateSessionsV1ToV2(rawSessions);
   const sessions = allSessions[args.service];
   if (!sessions || sessions.length === 0) {
     io.err(`no lease found for service "${args.service}"`);
@@ -649,7 +640,7 @@ export async function envCommand(
     return 1;
   }
 
-  const session = selectLease(sessions, now(), args.lease);
+  const session = selectLease(sessions, currentSeconds, args.lease);
   if (!session) {
     io.err(`no valid lease found for service "${args.service}"`);
     if (args.lease) {

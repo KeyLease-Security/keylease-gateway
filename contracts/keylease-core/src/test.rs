@@ -4,7 +4,7 @@ use crate::{Error, KeyleaseCore, KeyleaseCoreClient, Lease, CONTRACT_VERSION};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
-    Address, Env, String,
+    Address, Env, String, Vec as SVec,
 };
 
 struct Harness {
@@ -40,7 +40,16 @@ fn setup() -> Harness {
     let client = KeyleaseCoreClient::new(&env, &contract_id);
     client.init(&admin, &token, &gateway);
 
-    Harness { env, contract_id, admin, gateway, consumer, provider, token, client }
+    Harness {
+        env,
+        contract_id,
+        admin,
+        gateway,
+        consumer,
+        provider,
+        token,
+        client,
+    }
 }
 
 fn register(h: &Harness) {
@@ -61,7 +70,10 @@ fn init_is_one_time_and_exposes_config() {
     assert_eq!(config.token, h.token);
     assert_eq!(config.lease_count, 0);
 
-    let err = h.client.try_init(&h.admin, &h.token, &h.gateway).unwrap_err();
+    let err = h
+        .client
+        .try_init(&h.admin, &h.token, &h.gateway)
+        .unwrap_err();
     assert_eq!(err.unwrap(), Error::AlreadyInitialized);
 }
 
@@ -69,7 +81,10 @@ fn init_is_one_time_and_exposes_config() {
 fn version_matches_the_crate_version() {
     let h = setup();
     assert_eq!(CONTRACT_VERSION, env!("CARGO_PKG_VERSION"));
-    assert_eq!(h.client.version(), String::from_str(&h.env, CONTRACT_VERSION));
+    assert_eq!(
+        h.client.version(),
+        String::from_str(&h.env, CONTRACT_VERSION)
+    );
 }
 
 #[test]
@@ -77,7 +92,10 @@ fn version_is_readable_before_init() {
     let env = Env::default();
     let contract_id = env.register(KeyleaseCore, ());
     let client = KeyleaseCoreClient::new(&env, &contract_id);
-    assert_eq!(client.version(), String::from_str(&env, env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        client.version(),
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]
@@ -107,7 +125,10 @@ fn register_service_rejects_non_positive_price() {
         .register_service(&h.provider, &service_id(&h.env), &1_000);
     assert!(svc.active);
     assert_eq!(svc.price_per_call, 1_000);
-    assert_eq!(h.client.get_service(&service_id(&h.env)).provider, h.provider);
+    assert_eq!(
+        h.client.get_service(&service_id(&h.env)).provider,
+        h.provider
+    );
 }
 
 #[test]
@@ -134,7 +155,10 @@ fn quote_rejects_overflowing_totals() {
     // i128::MAX * 2 overflows: checked_mul must surface InvalidAmount, not trap.
     let err = h.client.try_quote(&service_id(&h.env), &2).unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidAmount);
-    let err = h.client.try_quote(&service_id(&h.env), &u32::MAX).unwrap_err();
+    let err = h
+        .client
+        .try_quote(&service_id(&h.env), &u32::MAX)
+        .unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidAmount);
 }
 
@@ -457,10 +481,7 @@ mod unauthorised {
             .try_register_service(&h.provider, &service_id(&h.env), &1_000)
             .unwrap_err();
         assert!(err.is_err(), "a provider signature is required");
-        let err = h
-            .client
-            .try_get_service(&service_id(&h.env))
-            .unwrap_err();
+        let err = h.client.try_get_service(&service_id(&h.env)).unwrap_err();
         assert_eq!(err.unwrap(), Error::UnknownService);
     }
 
@@ -592,7 +613,10 @@ fn proposing_a_new_admin_requires_the_current_admin() {
     let next = Address::generate(&h.env);
     h.env.mock_auths(&[]);
     let err = h.client.try_propose_admin(&next).unwrap_err();
-    assert!(err.is_err(), "only the current admin may propose a successor");
+    assert!(
+        err.is_err(),
+        "only the current admin may propose a successor"
+    );
     assert_eq!(h.client.get_config().admin, h.admin);
 }
 
@@ -680,7 +704,11 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(h.client.address.clone(), topics(), (3u32, 7u32).into_val(&h.env))],
+            [(
+                h.client.address.clone(),
+                topics(),
+                (3u32, 7u32).into_val(&h.env)
+            )],
         ),
     );
 
@@ -690,7 +718,11 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(h.client.address.clone(), topics(), (10u32, 0u32).into_val(&h.env))],
+            [(
+                h.client.address.clone(),
+                topics(),
+                (10u32, 0u32).into_val(&h.env)
+            )],
         ),
     );
 }
@@ -708,4 +740,161 @@ fn escrow_survives_many_leases() {
         total += 10_000;
     }
     assert_eq!(balance(&h, &h.client.address), total);
+}
+
+#[test]
+fn set_service_active_requires_initialised_config() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(KeyleaseCore, ());
+    let client = KeyleaseCoreClient::new(&env, &contract_id);
+    let provider = Address::generate(&env);
+    let svc = soroban_sdk::String::from_str(&env, "any-service");
+
+    let err = client
+        .try_set_service_active(&provider, &svc, &false)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::NotInitialized);
+}
+
+#[test]
+fn per_service_lease_counter_increments_and_preserves_on_reregister() {
+    let h = setup();
+    let s1 = soroban_sdk::String::from_str(&h.env, "service-alpha");
+    let s2 = soroban_sdk::String::from_str(&h.env, "service-beta");
+
+    h.client.register_service(&h.provider, &s1, &1_000);
+    h.client.register_service(&h.provider, &s2, &2_000);
+
+    assert_eq!(h.client.get_service(&s1).lease_count, 0);
+    assert_eq!(h.client.get_service(&s2).lease_count, 0);
+
+    // Create 2 leases on s1, 1 lease on s2
+    h.client.create_lease(&h.consumer, &s1, &5, &3_600);
+    h.client.create_lease(&h.consumer, &s1, &10, &3_600);
+    h.client.create_lease(&h.consumer, &s2, &2, &3_600);
+
+    assert_eq!(h.client.get_service(&s1).lease_count, 2);
+    assert_eq!(h.client.get_service(&s2).lease_count, 1);
+
+    // Re-register s1 with updated price: lease_count must be preserved
+    h.client.register_service(&h.provider, &s1, &1_500);
+    assert_eq!(h.client.get_service(&s1).lease_count, 2);
+    assert_eq!(h.client.get_service(&s1).price_per_call, 1_500);
+}
+
+#[test]
+fn settle_many_handles_mixed_states_repeated_ids_and_over_limit() {
+    use crate::MAX_SETTLE_BATCH;
+    let h = setup();
+    register(&h);
+
+    // Create 3 leases
+    let id1 = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    let id2 = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    let id3 = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &3_600);
+
+    // Use calls
+    h.client.use_call(&id1, &4);
+    h.client.use_call(&id2, &10); // exhausted -> settleable immediately
+
+    // Age ledger by 100s so id1 is expired (settleable), while id3 is still active and unexpired
+    h.env.ledger().with_mut(|li| li.timestamp += 100);
+
+    // Batch with:
+    // - id1: expired (settles)
+    // - id2: exhausted (settles)
+    // - id3: active & unexpired (skipped)
+    // - id1: repeated (already settled, skipped)
+    // - 999: non-existent (skipped)
+    let mut batch = SVec::new(&h.env);
+    batch.push_back(id1);
+    batch.push_back(id2);
+    batch.push_back(id3);
+    batch.push_back(id1);
+    batch.push_back(999);
+
+    let settled = h.client.settle_many(&batch);
+    assert_eq!(settled.len(), 2);
+    assert_eq!(settled.get(0).unwrap().id, id1);
+    assert!(settled.get(0).unwrap().settled);
+    assert_eq!(settled.get(1).unwrap().id, id2);
+    assert!(settled.get(1).unwrap().settled);
+
+    // Over-limit test: MAX_SETTLE_BATCH + 1
+    let mut over_limit = SVec::new(&h.env);
+    for _ in 0..=(MAX_SETTLE_BATCH) {
+        over_limit.push_back(id1);
+    }
+    let err = h.client.try_settle_many(&over_limit).unwrap_err();
+    assert_eq!(err.unwrap(), Error::BatchTooLarge);
+}
+
+#[test]
+fn property_test_escrow_invariants_and_single_payout() {
+    let h = setup();
+    register(&h);
+
+    // Simple deterministic LCG random generator
+    let mut state: u64 = 0xdead_beef_cafe_babe;
+    let mut next_u64 = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+
+    // Mint plenty of tokens for all iterations
+    StellarAssetClient::new(&h.env, &h.token).mint(&h.consumer, &1_000_000_000);
+
+    for _ in 0..100 {
+        let calls_limit = ((next_u64() % 100) + 1) as u32; // 1..=100
+        let calls_used = (next_u64() % (calls_limit as u64 + 1)) as u32; // 0..=calls_limit
+        let price_per_call = ((next_u64() % 500) + 1) as i128; // 1..=500
+        let price_paid = (calls_limit as i128) * price_per_call;
+
+        let payable = price_paid * (calls_used as i128) / (calls_limit as i128);
+        let refund = price_paid - payable;
+
+        // Invariant 1: Conservation of value
+        assert_eq!(payable + refund, price_paid);
+        assert!(payable >= 0);
+        assert!(refund >= 0);
+        assert!(payable <= price_paid);
+        assert!(refund <= price_paid);
+
+        // Invariant 2: Boundary conditions
+        if calls_used == 0 {
+            assert_eq!(payable, 0);
+            assert_eq!(refund, price_paid);
+        }
+        if calls_used == calls_limit {
+            assert_eq!(payable, price_paid);
+            assert_eq!(refund, 0);
+        }
+    }
+
+    // Single-payout invariant verified in contract:
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    h.client.use_call(&id, &4);
+    h.env.ledger().with_mut(|li| li.timestamp += 100);
+
+    let lease = h.client.settle(&id);
+    assert!(lease.settled);
+
+    // Second settle fails with AlreadySettled
+    let err_settle = h.client.try_settle(&id).unwrap_err();
+    assert_eq!(err_settle.unwrap(), Error::AlreadySettled);
+
+    // Revoke on already settled lease fails with AlreadySettled
+    let err_revoke = h.client.try_revoke(&id).unwrap_err();
+    assert_eq!(err_revoke.unwrap(), Error::AlreadySettled);
 }

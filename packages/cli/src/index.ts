@@ -171,7 +171,12 @@ function validateRpcUrl(url: string): void {
   // Allow http: only for localhost/127.0.0.1
   if (scheme === 'http:') {
     const hostname = parsed.hostname;
-    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1') {
+    if (
+      hostname !== 'localhost' &&
+      hostname !== '127.0.0.1' &&
+      hostname !== '::1' &&
+      hostname !== '[::1]'
+    ) {
       throw new CliError(
         `invalid --rpc URL "${url}": http: is only allowed for localhost, not ${hostname}`,
         'invalid_option',

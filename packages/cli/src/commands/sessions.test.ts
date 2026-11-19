@@ -80,8 +80,8 @@ describe('sessionsCommand', () => {
   it('prunes expired sessions and reports the removed count', async () => {
     const store = fileSessionStore(dir);
     await store.saveAll({
-      'expired-api': session('expired-api', 'lease-old', NOW),
-      'active-api': session('active-api', 'lease-current', NOW + 60),
+      'expired-api': [session('expired-api', 'lease-old', NOW)],
+      'active-api': [session('active-api', 'lease-current', NOW + 60)],
     });
     const { io, out } = captureIo();
 
@@ -94,7 +94,7 @@ describe('sessionsCommand', () => {
 
     expect(out).toEqual(['Pruned 1 expired session.']);
     await expect(store.load()).resolves.toEqual({
-      'active-api': session('active-api', 'lease-current', NOW + 60),
+      'active-api': [session('active-api', 'lease-current', NOW + 60)],
     });
   });
 
