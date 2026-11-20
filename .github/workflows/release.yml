@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -55,19 +57,155 @@ jobs:
           pnpm --filter @keylease/cli pack --pack-destination "$GITHUB_WORKSPACE/release-assets"
           pnpm --filter @keylease/proxy pack --pack-destination "$GITHUB_WORKSPACE/release-assets"
 
+      # pnpm ships its own CycloneDX generator, so the workspace SBOM comes from
+      # the same lockfile the packages were built from.
+      - name: Generate pnpm CycloneDX SBOM
+        run: pnpm sbom --sbom-format cyclonedx --out release-assets/sbom-pnpm.cdx.json
+
       - name: Upload release bundle
         uses: actions/upload-artifact@v4
         with:
           name: release-bundle
           path: |
             release-assets/*.tgz
+            release-assets/*.cdx.json
             release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  contract:
+    name: contract · test · wasm · sbom
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust (wasm32v1-none)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/keylease-core
+
+      # soroban-sdk 29 requires stellar-cli to produce a deployable wasm
+      - name: Install stellar-cli
+        run: |
+          curl -sSL \
+            https://github.com/stellar/stellar-cli/releases/download/v28.1.0/stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz \
+            -o /tmp/stellar-cli.tar.gz
+          tar -xzf /tmp/stellar-cli.tar.gz -C /usr/local/bin stellar
+          stellar --version
+
+      - name: Contract unit tests
+        run: cargo test --manifest-path contracts/keylease-core/Cargo.toml
+
+      - name: Build contract wasm
+        run: cd contracts/keylease-core && stellar contract build
+
+      # Pinned release of the OWASP CycloneDX Rust generator; the checksum is
+      # verified before the binary is used.
+      - name: Install cargo-cyclonedx
+        env:
+          CARGO_CYCLONEDX_VERSION: 0.5.10
+          CARGO_CYCLONEDX_SHA256: 2e4ef64a53c0a38d4b7d805c593b5f47ecd29821e98d81e484d03abaa0edb95f
+        run: |
+          set -euo pipefail
+          archive="cargo-cyclonedx-x86_64-unknown-linux-gnu.tar.xz"
+          base="https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-${CARGO_CYCLONEDX_VERSION}"
+          curl -sSfL "$base/$archive" -o "/tmp/$archive"
+          echo "${CARGO_CYCLONEDX_SHA256}  /tmp/$archive" | sha256sum -c -
+          tar -xJf "/tmp/$archive" -C /tmp
+          install -m 0755 "/tmp/cargo-cyclonedx-x86_64-unknown-linux-gnu/cargo-cyclonedx" \
+            "$HOME/.cargo/bin/cargo-cyclonedx"
+          cargo cyclonedx --help >/dev/null
+
+      - name: Generate contract CycloneDX SBOM and collect wasm
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cargo cyclonedx \
+            --format json \
+            --spec-version 1.5 \
+            --override-filename keylease-core.cdx \
+            --manifest-path contracts/keylease-core/Cargo.toml
+          mv contracts/keylease-core/keylease-core.cdx.json release-assets/sbom-rust.cdx.json
+          cp contracts/keylease-core/target/wasm32v1-none/release/keylease_core.wasm \
+            release-assets/keylease-core.wasm
+
+      - name: Upload contract bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-bundle
+          path: |
+            release-assets/keylease-core.wasm
+            release-assets/sbom-rust.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    name: attest build provenance
+    # Runs only after the artifacts exist, and before anything is published.
+    needs: [checks, contract]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: .
+
+      - name: Download contract bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-bundle
+          path: .
+
+      - name: Attest package tarballs
+        id: packages
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-assets/*.tgz
+
+      - name: Attest contract wasm
+        id: wasm
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-assets/keylease-core.wasm
+
+      # GitHub keeps the signed attestation; these bundles are the attached,
+      # offline-checkable copy for the release.
+      - name: Collect attestation bundles
+        run: |
+          set -euo pipefail
+          cp "${{ steps.packages.outputs.bundle-path }}" \
+            release-assets/keylease-packages.attestation.jsonl
+          cp "${{ steps.wasm.outputs.bundle-path }}" \
+            release-assets/keylease-core-wasm.attestation.jsonl
+
+      - name: Upload attestation bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestations
+          path: release-assets/*.attestation.jsonl
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: create GitHub release
-    needs: checks
+    needs: [checks, contract, attest]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -78,6 +216,47 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: release-bundle
+          path: .
+
+      - name: Download contract bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-bundle
+          path: .
+
+      - name: Download attestation bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: attestations
+          path: .
+
+      # Fail before creating a release if any attested artifact or SBOM is
+      # missing, so a partial upload cannot look like a complete one.
+      - name: Verify release assets are present
+        run: |
+          set -euo pipefail
+          cd release-assets
+          shopt -s nullglob
+          tarballs=( *.tgz )
+          sboms=( *.cdx.json )
+          bundles=( *.attestation.jsonl )
+          if [ "${#tarballs[@]}" -eq 0 ]; then
+            echo "::error::no package tarballs were packaged"
+            exit 1
+          fi
+          if [ ! -f keylease-core.wasm ]; then
+            echo "::error::keylease-core.wasm is missing"
+            exit 1
+          fi
+          if [ "${#sboms[@]}" -lt 2 ]; then
+            echo "::error::expected the pnpm and Rust CycloneDX SBOMs"
+            exit 1
+          fi
+          if [ "${#bundles[@]}" -lt 2 ]; then
+            echo "::error::expected provenance bundles for the tarballs and the wasm"
+            exit 1
+          fi
+          ls -l "${tarballs[@]}" keylease-core.wasm "${sboms[@]}" "${bundles[@]}"
 
       - name: Create release
         env:
@@ -91,6 +270,9 @@ jobs:
           fi
           gh release create "$GITHUB_REF_NAME" \
             release-assets/*.tgz \
+            release-assets/keylease-core.wasm \
+            release-assets/*.cdx.json \
+            release-assets/*.attestation.jsonl \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --notes-file release-notes.md \

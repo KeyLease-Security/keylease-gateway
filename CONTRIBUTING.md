@@ -19,7 +19,7 @@ pnpm lint           # eslint
 pnpm typecheck      # build + tsc --noEmit
 
 # contract (needs Rust + stellar-cli)
-pnpm contract:test  # cargo test (22 tests)
+pnpm contract:test  # cargo test (40 tests)
 pnpm contract:build # stellar contract build -> wasm32v1-none
 ```
 

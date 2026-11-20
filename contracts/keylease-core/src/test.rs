@@ -465,6 +465,114 @@ fn use_call_accumulates_and_clamps_at_the_limit() {
 }
 
 #[test]
+fn pause_blocks_new_leases_and_resumes_cleanly() {
+    let h = setup();
+    register(&h);
+    assert!(!h.client.get_config().paused);
+
+    let escrow_before = balance(&h, &h.client.address);
+    assert!(h.client.set_paused(&true));
+    assert!(h.client.get_config().paused);
+
+    // A paused contract allocates no lease and moves no tokens.
+    let consumer_before = balance(&h, &h.consumer);
+    let err = h
+        .client
+        .try_create_lease(&h.consumer, &service_id(&h.env), &10, &60)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::Paused);
+    assert_eq!(balance(&h, &h.consumer), consumer_before);
+    assert_eq!(balance(&h, &h.client.address), escrow_before);
+    assert_eq!(h.client.get_config().lease_count, 0);
+
+    // Resuming needs no other state change.
+    assert!(!h.client.set_paused(&false));
+    assert!(!h.client.get_config().paused);
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
+    assert_eq!(id, 1);
+}
+
+#[test]
+fn existing_leases_stay_usable_revocable_and_settleable_while_paused() {
+    let h = setup();
+    register(&h);
+    let settling = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &4, &60);
+    let revocable = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &4, &3_600);
+
+    h.client.set_paused(&true);
+
+    // The gateway can still commit served calls on existing leases.
+    let lease = h.client.use_call(&settling, &2);
+    assert_eq!(lease.calls_used, 2);
+    assert_eq!(h.client.remaining_calls(&settling), 2);
+
+    // The consumer can still revoke and be refunded for unused calls.
+    let consumer_before = balance(&h, &h.consumer);
+    h.client.revoke(&revocable);
+    assert_eq!(balance(&h, &h.consumer), consumer_before + 4_000);
+    assert_eq!(balance(&h, &h.client.address), 4_000);
+
+    // Settlement still pays the provider for consumed calls.
+    h.env.ledger().with_mut(|li| li.timestamp = 61);
+    let settled = h.client.settle(&settling);
+    assert!(settled.settled && !settled.active);
+    assert_eq!(balance(&h, &h.provider), 2_000);
+    assert_eq!(balance(&h, &h.client.address), 0);
+}
+
+#[test]
+fn pause_and_resume_emit_events() {
+    use soroban_sdk::{testutils::Events as _, IntoVal, Symbol, Vec as SVec};
+
+    let h = setup();
+
+    h.client.set_paused(&true);
+    assert_eq!(
+        h.env.events().all(),
+        SVec::from_array(
+            &h.env,
+            [(
+                h.client.address.clone(),
+                SVec::from_array(
+                    &h.env,
+                    [
+                        Symbol::new(&h.env, "paused").into_val(&h.env),
+                        h.admin.clone().into_val(&h.env),
+                    ],
+                ),
+                true.into_val(&h.env),
+            )],
+        ),
+    );
+
+    h.client.set_paused(&false);
+    assert_eq!(
+        h.env.events().all(),
+        SVec::from_array(
+            &h.env,
+            [(
+                h.client.address.clone(),
+                SVec::from_array(
+                    &h.env,
+                    [
+                        Symbol::new(&h.env, "unpaused").into_val(&h.env),
+                        h.admin.clone().into_val(&h.env),
+                    ],
+                ),
+                false.into_val(&h.env),
+            )],
+        ),
+    );
+    assert!(!h.client.get_config().paused);
+}
+
+#[test]
 fn use_call_rejects_unknown_expired_and_settled_leases() {
     let h = setup();
     register(&h);
@@ -660,6 +768,16 @@ mod unauthorised {
         assert!(err.is_err(), "a provider signature is required");
         let err = h.client.try_get_service(&service_id(&h.env)).unwrap_err();
         assert_eq!(err.unwrap(), Error::UnknownService);
+    }
+
+    #[test]
+    fn set_paused_requires_the_admin() {
+        let h = setup();
+        clear_auths(&h);
+
+        let err = h.client.try_set_paused(&true).unwrap_err();
+        assert!(err.is_err(), "only the admin may pause new leases");
+        assert!(!h.client.get_config().paused);
     }
 
     #[test]

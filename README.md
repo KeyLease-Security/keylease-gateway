@@ -535,6 +535,7 @@ An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 | --- | --- | --- |
 | `init(admin, token, gateway)` | admin | One-time setup with the escrow token (native SAC) and the gateway account |
 | `set_gateway(gateway)` | admin | Rotate the account allowed to commit quota |
+| `set_paused(paused)` | admin | Emergency pause: while `true`, `create_lease` fails with `Paused` before any escrow moves; existing leases keep being served, revoked and settled |
 | `propose_admin(new_admin)` | admin | Nominate the next admin; nothing changes until the nominee accepts |
 | `accept_admin()` | pending admin | Complete a handover (the nominee must authorise) and clear the pending slot |
 | `register_service(provider, service, price_per_call)` | provider | Register or re-price a service (`price_per_call > 0`) |
@@ -575,11 +576,34 @@ tuple, so existing topic filters still match, but its payload is now the pair
 `(calls_used, remaining)`. Both fields are `u32`; indexers that decoded a bare
 `calls_used` value must read the pair (or the first element).
 
+Escrow invariant: the contract only ever pays out `price_paid` once per lease,
+split as `used/total` to the provider and `(total-used)/total` to the consumer.
+
+### Emergency pause
+
+`set_paused(true)` is the admin's circuit breaker for new exposure. It is the
+only entry point the flag affects: `create_lease` returns `Error::Paused`
+before the escrow transfer, so no tokens move and no lease id is allocated.
+Everything that unwinds existing exposure keeps working — `use_call`,
+`revoke`, `settle`, `quote`, `register_service`, `set_service_active` and every
+view — and escrow is never touched, so prepaid leases can still be consumed,
+revoked and settled while the contract is paused. Resuming with
+`set_paused(false)` needs no other state change. Each transition emits `paused`
+or `unpaused` with the acting admin in the topic and the new state as the
+payload, and `get_config()` exposes `paused`. The pause is admin-only, so treat
+it as an incident-response action and record why it was taken (see
+[SECURITY.md](./SECURITY.md)).
+
+### Contract errors
+
 Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
-`Error(Contract, #n)`:
+`Error(Contract, #n)`. The numeric codes are part of the ABI and are only ever
+appended, so the table below is stable across additive releases:
 
 | Code | Variant | Meaning |
 | --- | --- | --- |
+| 1 | `AlreadyInitialized` | `init` ran more than once |
+| 2 | `NotInitialized` | `init` has not been called yet |
 | 3 | `UnknownService` | Service id was never registered |
 | 4 | `ServiceInactive` | Service paused by its provider |
 | 5 | `LeaseNotFound` | No lease with that id (proxy → `403 lease_not_found`) |
@@ -589,6 +613,7 @@ Contract failures are typed (`Error` enum) and surface in the CLI/proxy as
 | 9 | `AlreadySettled` | Escrow already paid out; also rejects `extend_lease` |
 | 10–13 | `InvalidCalls`, `InvalidDuration`, `InvalidPrice`, `InvalidAmount` | Argument validation; `extend_lease` uses 10 when both extension arguments are zero or `calls_limit` would overflow, 11 when expiry would overflow and 13 when the top-up price would overflow |
 | 15 | `InvalidConsumer` | `create_lease` consumer is the contract's own address |
+| 16 | `Paused` | `create_lease` blocked by the admin emergency pause |
 
 `extend_lease` reuses the existing typed errors rather than adding a variant:
 code 5 for an unknown lease, 6 for an inactive lease, 7 for an expired lease and

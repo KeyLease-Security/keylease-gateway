@@ -39,6 +39,12 @@ const MIN_TTL: u32 = DAY_IN_LEDGERS * 7;
 /// Extend it to a month.
 const EXTEND_TO: u32 = DAY_IN_LEDGERS * 30;
 
+/// Typed contract failures.
+///
+/// The numeric value is part of the ABI: callers see it as
+/// `Error(Contract, #n)` and indexers log it, so variants are only ever
+/// appended. The published code table lives in the README section "Contract
+/// reference".
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -59,6 +65,8 @@ pub enum Error {
     Unauthorized = 14,
     /// `create_lease` was called with the contract itself as consumer.
     InvalidConsumer = 15,
+    /// `create_lease` was blocked by the admin's emergency pause.
+    Paused = 16,
 }
 
 #[contracttype]
@@ -70,6 +78,10 @@ pub struct Config {
     /// Account allowed to commit served calls (`use_call`).
     pub gateway: Address,
     pub lease_count: u64,
+    /// Emergency switch for new leases. While `true`, `create_lease` fails
+    /// with [`Error::Paused`]; existing leases keep being served, revoked and
+    /// settled, and escrow is never touched.
+    pub paused: bool,
 }
 
 #[contracttype]
@@ -191,6 +203,7 @@ impl KeyleaseCore {
                 token,
                 gateway,
                 lease_count: 0,
+                paused: false,
             },
         );
         env.events()
@@ -209,6 +222,25 @@ impl KeyleaseCore {
             env.ledger().timestamp(),
         );
         Ok(())
+    }
+
+    /// Admin-only: pause or resume new leases.
+    ///
+    /// The pause is deliberately narrow: `create_lease` is rejected with
+    /// `Error::Paused` before any tokens move, while `use_call`, `revoke`,
+    /// `settle` and every view keep working so prepaid leases can still be
+    /// redeemed and paid out. Escrow balances are never modified here.
+    ///
+    /// Emits `paused` or `unpaused`, topic `(event, admin)`, payload `paused`.
+    pub fn set_paused(env: Env, paused: bool) -> Result<bool, Error> {
+        let mut config = load_config(&env)?;
+        config.admin.require_auth();
+        config.paused = paused;
+        store_config(&env, &config);
+        let event = if paused { "paused" } else { "unpaused" };
+        env.events()
+            .publish((Symbol::new(&env, event), config.admin.clone()), paused);
+        Ok(paused)
     }
 
     /// Admin-only: nominate the next admin. The handover only takes effect
@@ -336,6 +368,10 @@ impl KeyleaseCore {
         }
 
         let mut config = load_config(&env)?;
+        if config.paused {
+            // Circuit breaker: no new exposure, no escrow movement.
+            return Err(Error::Paused);
+        }
         let stored = load_service(&env, &service)?;
         if !stored.active {
             return Err(Error::ServiceInactive);
