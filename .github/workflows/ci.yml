@@ -39,6 +39,146 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Exercises the built artifact, not the source modules: the proxy must
+      # start with a minimal environment, reject a protected request with
+      # 401 missing_token, and exit cleanly on SIGTERM without writing to
+      # stderr.
+      - name: Smoke test built proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          entrypoint="packages/proxy/dist/index.js"
+          if [ ! -f "$entrypoint" ]; then
+            echo "::error::built proxy entrypoint $entrypoint is missing"
+            exit 1
+          fi
+
+          work_dir="$(mktemp -d)"
+          stdout_log="$work_dir/proxy.stdout.log"
+          stderr_log="$work_dir/proxy.stderr.log"
+          : >"$stdout_log"
+          : >"$stderr_log"
+
+          proxy_pid=""
+          cleanup() {
+            local status=$?
+            if [ -n "$proxy_pid" ] && kill -0 "$proxy_pid" 2>/dev/null; then
+              kill -TERM "$proxy_pid" 2>/dev/null || true
+              for _ in $(seq 1 20); do
+                kill -0 "$proxy_pid" 2>/dev/null || break
+                sleep 0.1
+              done
+              kill -KILL "$proxy_pid" 2>/dev/null || true
+            fi
+            if [ -n "$proxy_pid" ]; then
+              wait "$proxy_pid" 2>/dev/null || true
+            fi
+            if [ "$status" -ne 0 ]; then
+              echo "::group::proxy stdout"
+              cat "$stdout_log" || true
+              echo "::endgroup::"
+              echo "::group::proxy stderr"
+              cat "$stderr_log" || true
+              echo "::endgroup::"
+            fi
+            rm -rf "$work_dir"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          assert_clean_stderr() {
+            if [ -s "$stderr_log" ]; then
+              echo "::error::proxy wrote unexpected output to stderr"
+              cat "$stderr_log"
+              exit 1
+            fi
+          }
+
+          # Minimal configuration:
+          #   - a stub upstream that is never contacted (the request is denied
+          #     before any forwarding happens),
+          #   - a syntactically valid contract id (only its StrKey checksum is
+          #     validated at startup; the 401 path makes no RPC call),
+          #   - PORT=0 so the kernel assigns an ephemeral port.
+          KEYLEASE_UPSTREAM_URL="http://127.0.0.1:9" \
+          KEYLEASE_CONTRACT_ID="CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC" \
+          KEYLEASE_NETWORK="local" \
+          HOST="127.0.0.1" \
+          PORT="0" \
+            node "$entrypoint" >"$stdout_log" 2>"$stderr_log" &
+          proxy_pid=$!
+
+          # Readiness: wait (bounded) for the port the proxy logs once listening.
+          port=""
+          deadline=$((SECONDS + 15))
+          while [ -z "$port" ]; do
+            if ! kill -0 "$proxy_pid" 2>/dev/null; then
+              echo "::error::proxy exited before it started listening"
+              exit 1
+            fi
+            port="$(sed -n 's/.*"msg":"listening on http:\/\/127\.0\.0\.1:\([0-9]\{1,5\}\)".*/\1/p' "$stdout_log" | head -n1)"
+            if [ -n "$port" ]; then
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::proxy did not start listening within 15s"
+              exit 1
+            fi
+            sleep 0.1
+          done
+
+          echo "proxy listening on ephemeral port $port"
+          assert_clean_stderr
+
+          # A protected route without an Authorization header must be denied by
+          # the documented 401 response, not forwarded upstream.
+          PROXY_PORT="$port" node --input-type=module <<'NODE'
+          const url = `http://127.0.0.1:${process.env.PROXY_PORT}/v1/weather`;
+          const response = await fetch(url);
+          const body = await response.text();
+
+          if (response.status !== 401) {
+            console.error(`expected status 401 from ${url}, got ${response.status}: ${body}`);
+            process.exit(1);
+          }
+
+          let payload;
+          try {
+            payload = JSON.parse(body);
+          } catch {
+            console.error(`expected a JSON body from ${url}, got: ${body}`);
+            process.exit(1);
+          }
+
+          if (payload?.error !== 'missing_token') {
+            console.error(`expected error "missing_token" from ${url}, got: ${body}`);
+            process.exit(1);
+          }
+
+          console.log(`smoke: ${url} -> 401 ${body}`);
+          NODE
+
+          assert_clean_stderr
+
+          # SIGTERM must drain and exit 0. A watchdog bounds the wait so a hung
+          # shutdown fails the step instead of blocking the job.
+          ( sleep 10; kill -KILL "$proxy_pid" 2>/dev/null ) &
+          watchdog_pid=$!
+          kill -TERM "$proxy_pid"
+          exit_code=0
+          wait "$proxy_pid" || exit_code=$?
+          proxy_pid=""
+          kill "$watchdog_pid" 2>/dev/null || true
+          wait "$watchdog_pid" 2>/dev/null || true
+
+          if [ "$exit_code" -ne 0 ]; then
+            echo "::error::proxy did not exit cleanly on SIGTERM (status $exit_code)"
+            exit 1
+          fi
+          assert_clean_stderr
+          echo "smoke: built proxy exited cleanly on SIGTERM"
+
       - name: Typecheck (tsc --noEmit)
         run: pnpm -r typecheck
 

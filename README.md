@@ -72,57 +72,18 @@ packages/proxy           →  @keylease/proxy   lease-verifying reverse proxy
            └─────────────────┘
 ```
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant CLI as @keylease/cli
-    participant X as keylease-core (Soroban)
-    participant T as SAC token (XLM)
-    participant P as @keylease/proxy
-    participant U as Upstream API
-
-    C->>CLI: keylease acquire --service weather-api --calls 100 --secret S…
-    CLI->>X: create_lease(consumer, service, 100, 3600)
-    X->>T: transfer(consumer → contract, 100 × price_per_call)
-    X-->>CLI: lease_id = 2
-    CLI-->>C: kls1.<payload>.<ed25519 signature>
-
-    C->>P: GET /v1/weather (Authorization: Bearer kls1.…)
-    P->>P: verify ed25519 signature + expiry (offline)
-    P->>X: simulate get_lease(2)  (cached ≤ 30s)
-    X-->>P: { consumer, calls_limit, calls_used, expires_at, active }
-    P->>U: forwarded request + x-keylease-* headers
-    U-->>P: response
-    P-->>C: response + x-keylease-calls-remaining
-    P->>X: use_call(2, n)   (batched, gateway-signed)
-```
+The sequence of these steps, the trust boundaries between client, proxy,
+RPC, contract and SAC token, and the attacker model are documented in
+**[docs/architecture.md](./docs/architecture.md)**.
 
 ### Why it is shaped this way
 
-- **Access is prepaid on chain.** `create_lease` is not a registry write: it
-  transfers `calls × price_per_call` of the configured SAC token from the
-  consumer into the contract's escrow. A lease therefore cannot exist without
-  the consumer having paid for it, and the provider cannot be paid twice.
-- **Settlement is deterministic.** `settle` (permissionless after expiry or
-  quota exhaustion) pays `provider = price_paid × calls_used / calls_limit` and
-  refunds the remainder to the consumer. `revoke` does the same for the unused
-  calls immediately, with the consumer's authorisation.
-- **Quota is enforced on chain, not just in memory.** A proxy's local counter
-  is only a fast path; running a second proxy would otherwise mint free quota.
-  The gateway account commits served calls with `use_call`, so `calls_used` on
-  chain reflects real traffic and every instance sees the same remaining quota.
-- **The signature check is offline.** A bearer token is
-  `kls1.<base64url(payload)>.<ed25519 signature>` where the payload carries
-  `(v, lease_id, consumer, iat, exp)` and the signature is produced by the
-  consumer's Stellar key. Forged or expired tokens never reach the RPC layer.
-- **Reads go through simulation.** Lease state is read by simulating
-  `get_lease` over Soroban RPC rather than poking at raw contract storage, so
-  the proxy follows the contract's ABI instead of its storage layout, and
-  contract errors (`Error(Contract, #5)`) map to precise HTTP decisions.
-- **Long-lived entries are bumped.** Leases and services are persistent
-  entries whose TTL is extended on every write **and** every read, so a lease
-  does not disappear from state while it is still payable, even if it is only
-  ever read (the proxy's `get_lease` path).
+Access is prepaid into contract escrow; quota is committed on chain by the
+gateway so extra proxy instances cannot mint free calls; session tokens are
+verified offline before any RPC call; and lease state is read by simulating
+`get_lease`, so the proxy follows the contract ABI rather than its storage
+layout. Each of these controls, what it guarantees and what it does not, is
+set out in [docs/architecture.md](./docs/architecture.md).
 
 ---
 

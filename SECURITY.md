@@ -19,6 +19,10 @@ A good report includes:
 
 ## Scope
 
+The system architecture, assets, trust boundaries and attacker model are
+documented in [docs/architecture.md](./docs/architecture.md); use it to frame a
+report.
+
 In scope:
 
 - session token forgery, replay or expiry bypass (`kls1.*` bearer tokens)
