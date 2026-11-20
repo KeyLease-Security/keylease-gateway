@@ -21,6 +21,7 @@
  *   KEYLEASE_MAX_INFLIGHT    max concurrent proxied requests; excess get 503 + Retry-After
  *                            (default: 1024, 0 disables)
  *   KEYLEASE_FORWARD_AUTH    "true" to forward the caller's bearer token
+ *   KEYLEASE_FORWARD_HEADERS comma-separated additional request header names to forward
  *   KEYLEASE_METRICS_ENABLED "true" to expose Prometheus metrics on /metrics (default: false)
  *   KEYLEASE_SHUTDOWN_TIMEOUT_MS shutdown drain timeout in ms (default: 10000)
  *   PORT / HOST              listen address (default: 8080 / 0.0.0.0)
@@ -48,6 +49,7 @@ export interface ProxyEnv {
   KEYLEASE_CACHE_TTL_MS?: string | undefined;
   KEYLEASE_TRUST_PROXY?: string | undefined;
   KEYLEASE_FORWARD_AUTH?: string | undefined;
+  KEYLEASE_FORWARD_HEADERS?: string | undefined;
   KEYLEASE_METRICS_ENABLED?: string | undefined;
   KEYLEASE_SHUTDOWN_TIMEOUT_MS?: string | undefined;
   KEYLEASE_MAX_BODY_BYTES?: string | undefined;
@@ -69,6 +71,7 @@ export interface ResolvedConfig {
   port: number;
   cacheTtlMs: number;
   forwardAuthorization: boolean;
+  forwardHeaders: string[];
   trustProxy: boolean | number | string[];
   metricsEnabled: boolean;
   shutdownTimeoutMs: number;
@@ -106,6 +109,14 @@ function parseTrustProxy(raw: string | undefined): boolean | number | string[] {
     );
   }
   return entries;
+}
+
+function parseForwardHeaders(raw: string | undefined): string[] {
+  if (raw === undefined || raw.trim() === '') return [];
+  return raw
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .filter((name) => name.length > 0);
 }
 
 export function resolveConfig(env: ProxyEnv): ResolvedConfig {
@@ -159,6 +170,7 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     port,
     cacheTtlMs,
     forwardAuthorization: env.KEYLEASE_FORWARD_AUTH === 'true',
+    forwardHeaders: parseForwardHeaders(env.KEYLEASE_FORWARD_HEADERS),
     trustProxy: parseTrustProxy(env.KEYLEASE_TRUST_PROXY),
     metricsEnabled: env.KEYLEASE_METRICS_ENABLED === 'true',
     shutdownTimeoutMs: positiveInt(
@@ -187,6 +199,7 @@ export function describeConfig(config: ResolvedConfig): Record<string, unknown> 
     port: config.port,
     cacheTtlMs: config.cacheTtlMs,
     forwardAuthorization: config.forwardAuthorization,
+    forwardHeaders: config.forwardHeaders,
     trustProxy: config.trustProxy,
     metricsEnabled: config.metricsEnabled,
     shutdownTimeoutMs: config.shutdownTimeoutMs,
@@ -304,6 +317,7 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
     upstream: config.upstream,
     verifier,
     forwardAuthorization: config.forwardAuthorization,
+    forwardHeaders: config.forwardHeaders,
     trustProxy: config.trustProxy,
     metricsEnabled: config.metricsEnabled,
     maxBodyBytes: config.maxBodyBytes,

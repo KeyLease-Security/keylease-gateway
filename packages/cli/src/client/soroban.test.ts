@@ -10,7 +10,6 @@ import {
   encodeLeaseState,
   type Transaction,
   validateRpcUrl,
-  SorobanError,
   type LeaseState,
   type SorobanRpc,
 } from './soroban.js';

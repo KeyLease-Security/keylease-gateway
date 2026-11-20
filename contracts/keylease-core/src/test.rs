@@ -1,6 +1,9 @@
 extern crate std;
 
-use crate::{Error, KeyleaseCore, KeyleaseCoreClient, Lease, CONTRACT_VERSION};
+use crate::{
+    Error, KeyleaseCore, KeyleaseCoreClient, Lease, CONTRACT_VERSION, MAX_LEASE_DURATION,
+    MAX_SERVICE_LEN, MIN_SERVICE_LEN,
+};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
@@ -40,16 +43,7 @@ fn setup() -> Harness {
     let client = KeyleaseCoreClient::new(&env, &contract_id);
     client.init(&admin, &token, &gateway);
 
-    Harness {
-        env,
-        contract_id,
-        admin,
-        gateway,
-        consumer,
-        provider,
-        token,
-        client,
-    }
+    Harness { env, contract_id, admin, gateway, consumer, provider, token, client }
 }
 
 fn register(h: &Harness) {
@@ -70,10 +64,7 @@ fn init_is_one_time_and_exposes_config() {
     assert_eq!(config.token, h.token);
     assert_eq!(config.lease_count, 0);
 
-    let err = h
-        .client
-        .try_init(&h.admin, &h.token, &h.gateway)
-        .unwrap_err();
+    let err = h.client.try_init(&h.admin, &h.token, &h.gateway).unwrap_err();
     assert_eq!(err.unwrap(), Error::AlreadyInitialized);
 }
 
@@ -81,10 +72,7 @@ fn init_is_one_time_and_exposes_config() {
 fn version_matches_the_crate_version() {
     let h = setup();
     assert_eq!(CONTRACT_VERSION, env!("CARGO_PKG_VERSION"));
-    assert_eq!(
-        h.client.version(),
-        String::from_str(&h.env, CONTRACT_VERSION)
-    );
+    assert_eq!(h.client.version(), String::from_str(&h.env, CONTRACT_VERSION));
 }
 
 #[test]
@@ -92,10 +80,7 @@ fn version_is_readable_before_init() {
     let env = Env::default();
     let contract_id = env.register(KeyleaseCore, ());
     let client = KeyleaseCoreClient::new(&env, &contract_id);
-    assert_eq!(
-        client.version(),
-        String::from_str(&env, env!("CARGO_PKG_VERSION"))
-    );
+    assert_eq!(client.version(), String::from_str(&env, env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
@@ -125,10 +110,79 @@ fn register_service_rejects_non_positive_price() {
         .register_service(&h.provider, &service_id(&h.env), &1_000);
     assert!(svc.active);
     assert_eq!(svc.price_per_call, 1_000);
-    assert_eq!(
-        h.client.get_service(&service_id(&h.env)).provider,
-        h.provider
+    assert_eq!(h.client.get_service(&service_id(&h.env)).provider, h.provider);
+}
+
+#[test]
+fn register_service_validates_service_id_length_and_charset() {
+    let h = setup();
+
+    // Empty string
+    let empty = String::from_str(&h.env, "");
+    let err = h
+        .client
+        .try_register_service(&h.provider, &empty, &1_000)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidService);
+
+    // Too long (> 64 chars, 65 bytes)
+    let too_long = String::from_str(
+        &h.env,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     );
+    assert_eq!(too_long.len(), MAX_SERVICE_LEN + 1);
+    let err = h
+        .client
+        .try_register_service(&h.provider, &too_long, &1_000)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidService);
+
+    // Whitespace
+    for invalid in &["hello world", " leading", "trailing ", " \t "] {
+        let s = String::from_str(&h.env, invalid);
+        let err = h
+            .client
+            .try_register_service(&h.provider, &s, &1_000)
+            .unwrap_err();
+        assert_eq!(err.unwrap(), Error::InvalidService);
+    }
+
+    // Control characters
+    for invalid in &["api\nservice", "api\x00null", "api\r\n", "api\tname"] {
+        let s = String::from_str(&h.env, invalid);
+        let err = h
+            .client
+            .try_register_service(&h.provider, &s, &1_000)
+            .unwrap_err();
+        assert_eq!(err.unwrap(), Error::InvalidService);
+    }
+
+    // Disallowed punctuation / special characters
+    for invalid in &["api/v1", "api:v1", "api@v1", "api#1", "api$"] {
+        let s = String::from_str(&h.env, invalid);
+        let err = h
+            .client
+            .try_register_service(&h.provider, &s, &1_000)
+            .unwrap_err();
+        assert_eq!(err.unwrap(), Error::InvalidService);
+    }
+
+    // Valid: 1 char
+    let single = String::from_str(&h.env, "a");
+    assert_eq!(single.len(), MIN_SERVICE_LEN);
+    assert!(h.client.try_register_service(&h.provider, &single, &100).is_ok());
+
+    // Valid: exactly 64 chars
+    let max_len = String::from_str(
+        &h.env,
+        "abcdefghijklmnopqrstuvwxyz0123456789.ABCDEF-GHIJKLMNOP_QRSTUVWXY",
+    );
+    assert_eq!(max_len.len(), MAX_SERVICE_LEN);
+    assert!(h.client.try_register_service(&h.provider, &max_len, &100).is_ok());
+
+    // Valid: combination of allowed symbols
+    let symbols = String::from_str(&h.env, "my_service-v1.0");
+    assert!(h.client.try_register_service(&h.provider, &symbols, &100).is_ok());
 }
 
 #[test]
@@ -155,10 +209,7 @@ fn quote_rejects_overflowing_totals() {
     // i128::MAX * 2 overflows: checked_mul must surface InvalidAmount, not trap.
     let err = h.client.try_quote(&service_id(&h.env), &2).unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidAmount);
-    let err = h
-        .client
-        .try_quote(&service_id(&h.env), &u32::MAX)
-        .unwrap_err();
+    let err = h.client.try_quote(&service_id(&h.env), &u32::MAX).unwrap_err();
     assert_eq!(err.unwrap(), Error::InvalidAmount);
 }
 
@@ -252,6 +303,51 @@ fn create_lease_validates_its_arguments() {
 }
 
 #[test]
+fn create_lease_rejects_overflowing_and_excessive_durations() {
+    let h = setup();
+    register(&h);
+    let consumer_before = balance(&h, &h.consumer);
+    let escrow_before = balance(&h, &h.client.address);
+
+    // u64::MAX duration
+    let err = h
+        .client
+        .try_create_lease(&h.consumer, &service_id(&h.env), &10, &u64::MAX)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidDuration);
+
+    // u64::MAX - timestamp duration
+    let timestamp = h.env.ledger().timestamp();
+    let near_overflow = u64::MAX - timestamp;
+    let err = h
+        .client
+        .try_create_lease(&h.consumer, &service_id(&h.env), &10, &near_overflow)
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidDuration);
+
+    // Upper bound exceeded (MAX_LEASE_DURATION + 1)
+    let err = h
+        .client
+        .try_create_lease(&h.consumer, &service_id(&h.env), &10, &(MAX_LEASE_DURATION + 1))
+        .unwrap_err();
+    assert_eq!(err.unwrap(), Error::InvalidDuration);
+
+    // Verify token balance was not modified (tokens not moved on error)
+    assert_eq!(balance(&h, &h.consumer), consumer_before);
+    assert_eq!(balance(&h, &h.client.address), escrow_before);
+    assert_eq!(h.client.get_config().lease_count, 0);
+
+    // Exactly MAX_LEASE_DURATION succeeds
+    let id = h
+        .client
+        .create_lease(&h.consumer, &service_id(&h.env), &10, &MAX_LEASE_DURATION);
+    assert_eq!(id, 1);
+    let lease = h.client.get_lease(&id);
+    assert_eq!(lease.expires_at, timestamp + MAX_LEASE_DURATION);
+    assert_eq!(balance(&h, &h.consumer), consumer_before - 10_000);
+}
+
+#[test]
 fn create_lease_rejects_the_contract_as_consumer() {
     let h = setup();
     register(&h);
@@ -282,165 +378,6 @@ fn create_lease_allows_admin_and_gateway_as_consumers() {
         .client
         .create_lease(&h.gateway, &service_id(&h.env), &1, &60);
     assert_eq!(h.client.get_lease(&id).consumer, h.gateway);
-}
-
-#[test]
-fn extend_lease_grows_calls_expiry_and_escrow() {
-    let h = setup();
-    register(&h);
-    let id = h
-        .client
-        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
-    h.client.use_call(&id, &3);
-
-    let original_expiry = h.client.get_lease(&id).expires_at;
-    let consumer_before = balance(&h, &h.consumer);
-    let escrow_before = balance(&h, &h.client.address);
-
-    let lease = h.client.extend_lease(&id, &5, &120);
-    assert_eq!(lease.id, id);
-    assert_eq!(lease.calls_limit, 15);
-    assert_eq!(lease.calls_used, 3);
-    assert_eq!(lease.expires_at, original_expiry + 120);
-    assert_eq!(lease.price_paid, 15_000);
-    assert!(lease.active && !lease.settled);
-    assert_eq!(balance(&h, &h.consumer), consumer_before - 5_000);
-    assert_eq!(balance(&h, &h.client.address), escrow_before + 5_000);
-    assert_eq!(h.client.remaining_calls(&id), 12);
-    assert_eq!(h.client.get_config().lease_count, 1);
-
-    // The extra calls are usable: the old limit no longer clamps `use_call`.
-    let lease = h.client.use_call(&id, &12);
-    assert_eq!(lease.calls_limit, 15);
-    assert_eq!(lease.calls_used, 15);
-    assert_eq!(h.client.remaining_calls(&id), 0);
-}
-
-#[test]
-fn extend_lease_allows_one_nonzero_dimension_and_rejects_both_zero() {
-    let h = setup();
-    register(&h);
-    let id = h
-        .client
-        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
-    let original = h.client.get_lease(&id);
-
-    let err = h.client.try_extend_lease(&id, &0, &0).unwrap_err();
-    assert_eq!(err.unwrap(), Error::InvalidCalls);
-    assert_eq!(h.client.get_lease(&id), original);
-
-    // Duration only: no extra tokens move and the quota stays the same.
-    let consumer_before = balance(&h, &h.consumer);
-    let escrow_before = balance(&h, &h.client.address);
-    let lease = h.client.extend_lease(&id, &0, &30);
-    assert_eq!(lease.calls_limit, 10);
-    assert_eq!(lease.expires_at, original.expires_at + 30);
-    assert_eq!(lease.price_paid, 10_000);
-    assert_eq!(balance(&h, &h.consumer), consumer_before);
-    assert_eq!(balance(&h, &h.client.address), escrow_before);
-
-    // Calls only: expiry stays put while escrow and the limit grow.
-    let lease = h.client.extend_lease(&id, &2, &0);
-    assert_eq!(lease.calls_limit, 12);
-    assert_eq!(lease.expires_at, original.expires_at + 30);
-    assert_eq!(lease.price_paid, 12_000);
-    assert_eq!(balance(&h, &h.consumer), consumer_before - 2_000);
-    assert_eq!(balance(&h, &h.client.address), escrow_before + 2_000);
-}
-
-#[test]
-fn extend_lease_rejects_unknown_expired_inactive_and_settled_leases() {
-    let h = setup();
-    register(&h);
-    let err = h.client.try_extend_lease(&42, &1, &60).unwrap_err();
-    assert_eq!(err.unwrap(), Error::LeaseNotFound);
-
-    let id = h
-        .client
-        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
-    h.env.ledger().with_mut(|li| li.timestamp = 60);
-    let err = h.client.try_extend_lease(&id, &1, &60).unwrap_err();
-    assert_eq!(err.unwrap(), Error::LeaseExpired);
-
-    // A settled lease is rejected even when its clock has not advanced.
-    let h = setup();
-    register(&h);
-    let id = h
-        .client
-        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
-    h.client.revoke(&id);
-    let err = h.client.try_extend_lease(&id, &1, &60).unwrap_err();
-    assert_eq!(err.unwrap(), Error::AlreadySettled);
-
-    // `active = false, settled = false` has no public writer today, but the
-    // typed branch must still reject it if storage is ever migrated there.
-    let h = setup();
-    register(&h);
-    let id = h
-        .client
-        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
-    let mut lease = h.client.get_lease(&id);
-    lease.active = false;
-    lease.settled = false;
-    h.env.as_contract(&h.contract_id, || {
-        h.env
-            .storage()
-            .persistent()
-            .set(&crate::DataKey::Lease(id), &lease);
-    });
-    let err = h.client.try_extend_lease(&id, &1, &60).unwrap_err();
-    assert_eq!(err.unwrap(), Error::LeaseInactive);
-}
-
-#[test]
-fn extend_lease_uses_checked_arithmetic() {
-    let h = setup();
-    register(&h);
-    let id = h
-        .client
-        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
-    let original = h.client.get_lease(&id);
-    let consumer_before = balance(&h, &h.consumer);
-    let escrow_before = balance(&h, &h.client.address);
-
-    let err = h.client.try_extend_lease(&id, &u32::MAX, &0).unwrap_err();
-    assert_eq!(err.unwrap(), Error::InvalidCalls);
-    let err = h.client.try_extend_lease(&id, &0, &u64::MAX).unwrap_err();
-    assert_eq!(err.unwrap(), Error::InvalidDuration);
-
-    // Re-price the service so the create_lease price formula itself overflows.
-    h.client
-        .register_service(&h.provider, &service_id(&h.env), &i128::MAX);
-    let err = h.client.try_extend_lease(&id, &2, &0).unwrap_err();
-    assert_eq!(err.unwrap(), Error::InvalidAmount);
-
-    assert_eq!(h.client.get_lease(&id), original);
-    assert_eq!(balance(&h, &h.consumer), consumer_before);
-    assert_eq!(balance(&h, &h.client.address), escrow_before);
-}
-
-#[test]
-fn settlement_after_extension_pays_from_the_grown_escrow() {
-    let h = setup();
-    register(&h);
-    let id = h
-        .client
-        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
-    h.client.use_call(&id, &4);
-    let lease = h.client.extend_lease(&id, &5, &120);
-    assert_eq!(lease.price_paid, 15_000);
-    assert_eq!(lease.calls_limit, 15);
-    let new_expiry = lease.expires_at;
-
-    h.env.ledger().with_mut(|li| li.timestamp = new_expiry);
-    let consumer_before = balance(&h, &h.consumer);
-    let lease = h.client.settle(&id);
-
-    // 15_000 × 4 / 15 = 4_000 to the provider; the other 11_000 is refunded.
-    assert_eq!(balance(&h, &h.provider), 4_000);
-    assert_eq!(balance(&h, &h.consumer), consumer_before + 11_000);
-    assert_eq!(balance(&h, &h.client.address), 0);
-    assert!(lease.settled && !lease.active);
 }
 
 #[test]
@@ -615,24 +552,6 @@ mod unauthorised {
     }
 
     #[test]
-    fn extend_lease_requires_the_consumer() {
-        let h = setup();
-        register(&h);
-        let id = h
-            .client
-            .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
-        clear_auths(&h);
-
-        let before_consumer = balance(&h, &h.consumer);
-        let before_escrow = balance(&h, &h.client.address);
-        let err = h.client.try_extend_lease(&id, &5, &60).unwrap_err();
-        assert!(err.is_err(), "only the consumer may extend a lease");
-        assert_eq!(h.client.get_lease(&id).calls_limit, 10);
-        assert_eq!(balance(&h, &h.consumer), before_consumer);
-        assert_eq!(balance(&h, &h.client.address), before_escrow);
-    }
-
-    #[test]
     fn create_lease_requires_the_consumer() {
         let h = setup();
         register(&h);
@@ -658,7 +577,10 @@ mod unauthorised {
             .try_register_service(&h.provider, &service_id(&h.env), &1_000)
             .unwrap_err();
         assert!(err.is_err(), "a provider signature is required");
-        let err = h.client.try_get_service(&service_id(&h.env)).unwrap_err();
+        let err = h
+            .client
+            .try_get_service(&service_id(&h.env))
+            .unwrap_err();
         assert_eq!(err.unwrap(), Error::UnknownService);
     }
 
@@ -790,10 +712,7 @@ fn proposing_a_new_admin_requires_the_current_admin() {
     let next = Address::generate(&h.env);
     h.env.mock_auths(&[]);
     let err = h.client.try_propose_admin(&next).unwrap_err();
-    assert!(
-        err.is_err(),
-        "only the current admin may propose a successor"
-    );
+    assert!(err.is_err(), "only the current admin may propose a successor");
     assert_eq!(h.client.get_config().admin, h.admin);
 }
 
@@ -881,11 +800,7 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(
-                h.client.address.clone(),
-                topics(),
-                (3u32, 7u32).into_val(&h.env)
-            )],
+            [(h.client.address.clone(), topics(), (3u32, 7u32).into_val(&h.env))],
         ),
     );
 
@@ -895,42 +810,7 @@ fn calls_committed_event_publishes_used_and_remaining() {
         h.env.events().all(),
         SVec::from_array(
             &h.env,
-            [(
-                h.client.address.clone(),
-                topics(),
-                (10u32, 0u32).into_val(&h.env)
-            )],
-        ),
-    );
-}
-
-#[test]
-fn lease_extended_event_publishes_added_dimensions_and_amount() {
-    use soroban_sdk::{testutils::Events as _, IntoVal, Symbol, Vec as SVec};
-
-    let h = setup();
-    register(&h);
-    let id = h
-        .client
-        .create_lease(&h.consumer, &service_id(&h.env), &10, &60);
-    h.client.extend_lease(&id, &4, &90);
-
-    assert_eq!(
-        h.env.events().all(),
-        SVec::from_array(
-            &h.env,
-            [(
-                h.client.address.clone(),
-                SVec::from_array(
-                    &h.env,
-                    [
-                        Symbol::new(&h.env, "lease_extended").into_val(&h.env),
-                        h.consumer.clone().into_val(&h.env),
-                        id.into_val(&h.env),
-                    ],
-                ),
-                (4u32, 90u64, 4_000i128).into_val(&h.env),
-            )],
+            [(h.client.address.clone(), topics(), (10u32, 0u32).into_val(&h.env))],
         ),
     );
 }
