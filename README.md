@@ -529,7 +529,16 @@ An unknown shell exits with a usage error listing `bash`, `zsh` and `fish`.
 ## Contract reference
 
 `contracts/keylease-core` is a Soroban contract (`soroban-sdk` 29, built for
-`wasm32v1-none`).
+`wasm32v1-none`, ~15.9 KB wasm, enforced against a 20 KB CI budget).
+
+### Wasm Size Budget
+
+To keep deployment fees low and ensure execution fits safely within Soroban resource limits, CI enforces a hard budget on the compiled contract artifact (`target/wasm32v1-none/release/keylease_core.wasm`):
+
+- **Maximum Allowed Size**: 20 KB (20,480 bytes)
+- **Current Size**: ~15.9 KB (15,912 bytes)
+- **Enforcement**: The `contract` job in `.github/workflows/ci.yml` measures the built `.wasm` after `stellar contract build` and fails the build if the size exceeds 20 KB.
+- **Explicit Override**: For exceptional additions that justify exceeding the budget, applying the `wasm-size-override` label to the pull request with a documented explanation bypasses the size check.
 
 | Entry point | Auth | Description |
 | --- | --- | --- |

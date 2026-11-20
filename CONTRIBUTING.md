@@ -335,3 +335,37 @@ the expected failure mode.
   bodies, status codes).
 - Keep tests deterministic: inject a fake `clock`, a fake `SorobanRpc` and a
   fake committer instead of sleeping or hitting the network.
+
+## Test coverage thresholds
+
+`pnpm test` executes Vitest with v8 coverage enabled and fails builds if per-package floors are not met:
+
+| Package | Lines | Branches | Functions | Statements |
+| --- | --- | --- | --- | --- |
+| `@keylease/cli` | 80% | 75% | 75% | 80% |
+| `@keylease/proxy` | 85% | 80% | 85% | 85% |
+
+### Raising thresholds
+When adding features or improving test suites, coverage should not regress. If new test coverage raises the package average, raise the corresponding thresholds in `packages/*/vitest.config.ts` to lock in the gains. Threshold reductions require explicit maintainer approval in the PR.
+
+### Excluded files
+- Operational deployment scripts (`packages/cli/scripts/**`) are excluded from coverage calculations because they execute manual testnet rollout steps rather than runtime CLI library logic.
+- Generated code and build output (`dist/**`) and test files themselves (`src/**/*.test.ts`) are excluded.
+
+## Security analysis & CodeQL triage
+
+CodeQL static analysis runs automatically on all pull requests targeting `main` and on a weekly Sunday schedule, covering both TypeScript packages and the Rust contract crate.
+
+### Triaging CodeQL alerts
+1. Inspect the alert details under the repository's **Security > Code scanning** tab.
+2. If the alert identifies a valid flaw (e.g. unhandled error path, prototype injection, or arithmetic issue), write a reproduction test and address the root cause in a PR.
+3. If the alert is a false positive or intentional design pattern, dismiss the alert with a clear rationale referencing the relevant architecture or threat model.
+
+## Dependency updates (Dependabot)
+
+Dependabot is configured via `.github/dependabot.yml` to check for updates weekly on Mondays across three ecosystems:
+- **npm**: root pnpm workspace (`@keylease/cli` and `@keylease/proxy`)
+- **cargo**: contract crate (`contracts/keylease-core`)
+- **github-actions**: GitHub Actions workflow dependencies
+
+Minor and patch updates are grouped into single pull requests per ecosystem to minimize PR fatigue while ensuring fast dependency upgrades.

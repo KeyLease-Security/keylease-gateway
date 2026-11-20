@@ -45,6 +45,15 @@ jobs:
       - name: Test
         run: pnpm test
 
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: packages/*/coverage
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Upload test output on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -160,6 +169,35 @@ jobs:
 
       - name: Build contract wasm
         run: cd contracts/keylease-core && stellar contract build
+
+      - name: Enforce contract wasm size budget
+        env:
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          WASM="contracts/keylease-core/target/wasm32v1-none/release/keylease_core.wasm"
+          if [ ! -f "$WASM" ]; then
+            echo "::error::Built wasm artifact not found at $WASM"
+            exit 1
+          fi
+
+          SIZE=$(wc -c < "$WASM")
+          MAX_SIZE=20480 # 20 KB budget
+
+          echo "Contract wasm size: ${SIZE} bytes (budget: ${MAX_SIZE} bytes / 20 KB)"
+
+          # Check if the pull request carries the explicit override label
+          if echo "$PR_LABELS" | grep -q "wasm-size-override"; then
+            echo "⚠️ 'wasm-size-override' label detected on pull request. Bypassing size budget enforcement."
+            exit 0
+          fi
+
+          if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+            echo "::error::Contract wasm (${SIZE} bytes) exceeds the budget of ${MAX_SIZE} bytes (20 KB)."
+            echo "::error::To override this check for exceptional changes, add the 'wasm-size-override' label to the PR with a documented justification."
+            exit 1
+          fi
+
+          echo "✅ Contract wasm is within budget (${SIZE} <= ${MAX_SIZE} bytes)."
 
       - name: Upload contract wasm
         uses: actions/upload-artifact@v4
