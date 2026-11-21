@@ -1,7 +1,8 @@
 import { Keypair } from '@stellar/stellar-sdk';
 import { describe, expect, it } from 'vitest';
 import { CliError, parseArgv, renderHelp, run, type CliIo } from './index.js';
-import type { AcquireArgs, LeaseSession } from './commands/lease.js';
+import type { AcquireArgs, LeaseSession, QuoteArgs } from './commands/lease.js';
+import { ContractCallError } from './client/soroban.js';
 
 const NOW_MS = 1_700_000_000_000;
 const NOW = NOW_MS / 1000;
@@ -560,6 +561,30 @@ describe('parseArgv', () => {
     });
     expectCliError(() => parseArgv(['status', '--lease', '42', '--check-chain']), 'invalid_option');
   });
+
+  it('parses quote, rejecting zero calls and missing options', () => {
+    const invocation = parseArgv(['quote', '--service', 'weather-api', '--calls', '10']);
+    expect(invocation.command).toBe('quote');
+    expect((invocation as { args: QuoteArgs }).args).toMatchObject({
+      service: 'weather-api',
+      calls: 10,
+      json: false,
+    });
+
+    expectCliError(
+      () => parseArgv(['quote', '--service', 'weather-api', '--calls', '0']),
+      'invalid_option',
+    );
+    expectCliError(() => parseArgv(['quote', '--service', 'weather-api']), 'missing_option');
+    expectCliError(() => parseArgv(['quote', '--calls', '5']), 'missing_option');
+  });
+
+  it('accepts the global --quiet flag anywhere in argv', () => {
+    const after = parseArgv(['quote', '--service', 'weather-api', '--calls', '1', '--quiet']);
+    const before = parseArgv(['--quiet', 'quote', '--service', 'weather-api', '--calls', '1']);
+    expect(after).toEqual(before);
+    expect(after.command).toBe('quote');
+  });
 });
 
 describe('renderHelp', () => {
@@ -766,6 +791,101 @@ describe('run', () => {
     );
     expect(code).toBe(1);
     expect(err.join('\n')).toContain('rpc exploded');
+  });
+
+  it('dispatches quote and surfaces contract errors with exit code 1', async () => {
+    const ok = captureIo();
+    expect(
+      await run(['quote', '--service', 'weather-api', '--calls', '4', '--json'], ok.io, {
+        quote: { createClient: () => ({ quote: async () => 8_000_000 }) },
+      }),
+    ).toBe(0);
+    expect(JSON.parse(ok.out.join('\n'))).toEqual({
+      service: 'weather-api',
+      calls: 4,
+      price: 8_000_000,
+      asset: 'XLM',
+    });
+
+    const bad = captureIo();
+    expect(
+      await run(['quote', '--service', 'ghost-api', '--calls', '1'], bad.io, {
+        quote: {
+          createClient: () => ({
+            quote: async () => {
+              throw new ContractCallError('quote', 3, 'unknown service');
+            },
+          }),
+        },
+      }),
+    ).toBe(1);
+    expect(bad.err.join('\n')).toContain('failed with Error(3)');
+  });
+
+  it('suppresses stdout with --quiet while still saving the session', async () => {
+    const store = memoryStore();
+    const { io, out, err } = captureIo();
+
+    const code = await run(
+      [
+        'acquire',
+        '--quiet',
+        '--service',
+        'quiet-api',
+        '--calls',
+        '2',
+        '--duration',
+        '60',
+        '--secret',
+        SECRET,
+      ],
+      io,
+      {
+        acquire: {
+          now: () => NOW_MS,
+          store,
+          createClient: () => ({
+            createLease: async () => ({ leaseId: 'lease-quiet', txHash: null }),
+          }),
+        },
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(out).toEqual([]);
+    expect(err).toEqual([]);
+    expect(store.sessions['quiet-api']?.leaseId).toBe('lease-quiet');
+  });
+
+  it('keeps stderr and exit codes with --quiet', async () => {
+    const unknown = captureIo();
+    expect(await run(['--quiet', 'explode'], unknown.io)).toBe(2);
+    expect(unknown.out).toEqual([]);
+    expect(unknown.err.join('\n')).toContain('unknown command');
+
+    const missing = captureIo();
+    expect(await run(['--quiet', 'acquire', '--service', 'x'], missing.io)).toBe(2);
+    expect(missing.out).toEqual([]);
+    expect(missing.err.join('\n')).toContain('error:');
+
+    const failing = captureIo();
+    expect(
+      await run(
+        ['--quiet', 'acquire', '--service', 'x', '--calls', '1', '--duration', '1', '--secret', SECRET],
+        failing.io,
+        {
+          acquire: {
+            createClient: () => ({
+              createLease: async () => {
+                throw new Error('rpc exploded');
+              },
+            }),
+          },
+        },
+      ),
+    ).toBe(1);
+    expect(failing.out).toEqual([]);
+    expect(failing.err.join('\n')).toContain('rpc exploded');
   });
 
   it('reports a missing lease for env with exit code 1', async () => {

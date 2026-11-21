@@ -1,4 +1,5 @@
 import { request as httpRequest } from 'node:http';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { Keypair } from '@stellar/stellar-sdk';
 import { mintSessionToken } from '@keylease/cli/token';
 import type { LeaseState } from '@keylease/cli/soroban';
@@ -503,13 +504,46 @@ describe('proxy routing', () => {
     await app.close();
   });
 
-  it('answers HEAD without a body', async () => {
+  it('strips content-encoding when fetch already decoded a gzip body', async () => {
+    // Node's fetch decompresses gzip/br transparently but keeps the header, so
+    // the proxy receives plain bytes alongside `content-encoding: gzip`.
+    const payload = JSON.stringify({ temperature: 21, city: 'paris' });
+    const decoded = gunzipSync(gzipSync(Buffer.from(payload))).toString('utf8');
     const { impl } = stubFetch(
-      async () => new Response('ignored', { status: 200, headers: { 'content-type': 'text/plain' } }),
+      async () =>
+        new Response(decoded, {
+          status: 200,
+          headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+        }),
     );
     const app = buildProxyServer({
       upstream: 'https://api.example.com',
       verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/weather',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe(decoded);
+    expect(res.headers['content-encoding']).toBeUndefined();
+    expect(res.headers['content-length']).toBe(String(Buffer.byteLength(decoded)));
+    expect(res.headers['content-type']).toContain('application/json');
+    await app.close();
+  });
+
+  it('answers HEAD without a body even when the upstream sends one', async () => {
+    const { impl, calls } = stubFetch(
+      async () => new Response('ignored', { status: 200, headers: { 'content-type': 'text/plain' } }),
+    );
+    const verifier = makeVerifier({ getLeaseState: async () => leaseState() });
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier,
       fetchImpl: impl,
     });
 
@@ -521,6 +555,58 @@ describe('proxy routing', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.body).toBe('');
+    expect(res.headers['content-type']).toContain('text/plain');
+    expect(calls).toHaveLength(1);
+    // A HEAD response still consumes exactly one call.
+    expect(res.headers['x-keylease-calls-remaining']).toBe('9');
+    expect(verifier.localCalls('lease-1')).toBe(1);
+    await app.close();
+  });
+
+  it('forwards a 204 without a body and keeps its headers', async () => {
+    const { impl, calls } = stubFetch(
+      async () =>
+        new Response(null, { status: 204, headers: { 'x-upstream-note': 'no-content' } }),
+    );
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+
+    expect(res.statusCode).toBe(204);
+    expect(res.body).toBe('');
+    expect(res.headers['x-upstream-note']).toBe('no-content');
+    expect(calls).toHaveLength(1);
+    await app.close();
+  });
+
+  it('forwards a 304 without a body and keeps its headers', async () => {
+    const { impl, calls } = stubFetch(
+      async () => new Response(null, { status: 304, headers: { etag: '"v1"' } }),
+    );
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+
+    expect(res.statusCode).toBe(304);
+    expect(res.body).toBe('');
+    expect(res.headers['etag']).toBe('"v1"');
+    expect(calls).toHaveLength(1);
     await app.close();
   });
 
