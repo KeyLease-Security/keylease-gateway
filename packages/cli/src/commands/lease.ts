@@ -56,6 +56,12 @@ export interface EnvArgs {
   lease?: string;
 }
 
+export interface QuoteArgs extends NetworkArgs {
+  service: string;
+  calls: number;
+  json: boolean;
+}
+
 /** A locally stored lease session produced by `keylease acquire`. */
 export interface LeaseSession {
   service: string;
@@ -186,6 +192,10 @@ export interface EnvDeps {
   readFile?: (path: string) => Promise<string>;
   writeFile?: (path: string, contents: string) => Promise<void>;
   now?: () => number;
+}
+
+export interface QuoteDeps {
+  createClient?: (args: QuoteArgs) => Pick<SorobanClient, 'quote'>;
 }
 
 function isLeaseSession(value: unknown): value is LeaseSession {
@@ -768,5 +778,54 @@ export async function envCommand(
     io.out(`Wrote ${keys.length} keys to ${args.file}`);
     io.out(`  ${keys.join(', ')}`);
   }
+  return 0;
+}
+
+/** The native XLM token has 7 decimal places (stroops). */
+export const TOKEN_SMALLEST_UNITS_PER_XLM = 10_000_000;
+
+/** Renders a token amount in smallest units as a trimmed XLM string. */
+export function formatTokenAmount(smallestUnits: number): string {
+  const xlm = smallestUnits / TOKEN_SMALLEST_UNITS_PER_XLM;
+  const rendered = xlm.toFixed(7).replace(/\.?0+$/, '');
+  return `${rendered === '' ? '0' : rendered} XLM`;
+}
+
+function defaultQuoteClient(args: QuoteArgs): Pick<SorobanClient, 'quote'> {
+  return SorobanClient.fromEnv({
+    KEYLEASE_NETWORK: args.network,
+    KEYLEASE_RPC_URL: args.rpc,
+    KEYLEASE_CONTRACT_ID: args.contract,
+  });
+}
+
+/**
+ * `keylease quote --service <id> --calls <n>`
+ *
+ * Simulates the contract's read-only `quote` view so callers can price a batch
+ * before signing a `create_lease` transaction. Prices are token smallest units.
+ */
+export async function quoteCommand(
+  args: QuoteArgs,
+  io: CliIo,
+  deps: QuoteDeps = {},
+): Promise<number> {
+  const createClient = deps.createClient ?? defaultQuoteClient;
+  const price = await createClient(args).quote(args.service, args.calls);
+
+  if (args.json) {
+    io.out(
+      JSON.stringify(
+        { service: args.service, calls: args.calls, price, asset: 'XLM' },
+        null,
+        2,
+      ),
+    );
+    return 0;
+  }
+
+  io.out(`Quote for ${args.calls} call${args.calls === 1 ? '' : 's'} on "${args.service}":`);
+  io.out(`  price  : ${price} (token smallest units)`);
+  io.out(`  amount : ${formatTokenAmount(price)}`);
   return 0;
 }

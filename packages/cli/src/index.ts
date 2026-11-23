@@ -74,6 +74,7 @@ export type Invocation =
   | { command: 'help' }
   | { command: 'version' }
   | { command: 'acquire'; args: AcquireArgs }
+  | { command: 'quote'; args: QuoteArgs }
   | { command: 'env'; args: EnvArgs }
   | { command: 'status'; args: StatusArgs }
   | { command: 'settle'; args: SettleArgs }
@@ -84,6 +85,7 @@ export type Invocation =
 
 export interface RunDeps {
   acquire?: AcquireDeps;
+  quote?: QuoteDeps;
   env?: EnvDeps;
   status?: StatusDeps;
   settle?: SettleDeps;
@@ -347,6 +349,18 @@ export function parseArgv(argv: string[], options: ParseOptions = {}): Invocatio
       };
       return { command: 'acquire', args };
     }
+    case 'quote': {
+      ensureNoPositionals(positionals);
+      return {
+        command: 'quote',
+        args: {
+          ...networkArgs(values),
+          service: requireString(values, 'service'),
+          calls: requirePositiveInt(values, 'calls'),
+          json: values.json === true,
+        },
+      };
+    }
     case 'env': {
       ensureNoPositionals(positionals);
       const args: EnvArgs = {
@@ -496,6 +510,7 @@ Options:
   --contract <id>      keylease-core contract id override
   --prune              Remove expired sessions (for "sessions")
   --json               Machine-readable JSON output
+  --quiet              Suppress human-readable success output (errors still go to stderr)
   -h, --help           Show this help
 
 Error reference:
@@ -566,7 +581,7 @@ function hasJsonFlag(argv: string[]): boolean {
 /** Parses and dispatches a CLI invocation, returning a process exit code. */
 export async function run(
   argv: string[],
-  io: CliIo = consoleIo,
+  baseIo: CliIo = consoleIo,
   deps: RunDeps = {},
 ): Promise<number> {
   const json = hasJsonFlag(argv);
@@ -603,6 +618,8 @@ export async function run(
         return 0;
       case 'acquire':
         return await acquireCommand(invocation.args, io, deps.acquire);
+      case 'quote':
+        return await quoteCommand(invocation.args, io, deps.quote);
       case 'env':
         return await envCommand(invocation.args, io, deps.env);
       case 'status':

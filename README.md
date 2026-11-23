@@ -880,6 +880,15 @@ The on-chain quota sink tracks at most 10,000 distinct leases in its pending bat
 | `426 upgrade_required` | `Connection: upgrade` requests (e.g. WebSocket) are not supported; rejected before verification, so no call is consumed. The response carries `Upgrade: HTTP/1.1` |
 | `502 bad_gateway` / `504 gateway_timeout` | Upstream failure (only after the lease passed); `504` is produced when `KEYLEASE_UPSTREAM_TIMEOUT_MS` elapses |
 
+### Body encoding
+
+Node's `fetch` transparently decompresses `gzip`/`br` upstream responses, so the
+proxy forwards the decoded body and **normalises the headers** rather than
+forwarding compressed bytes: `content-encoding` is stripped, and
+`content-length` is regenerated from the bytes actually sent (and omitted for
+the empty bodies of `HEAD`, `204` and `304` responses). Clients and caches never
+receive encoding metadata that disagrees with the body.
+
 Every response carries `x-request-id`: a valid inbound value (1-128 chars of `A-Za-z0-9._:~+=/-`) is reused, anything else is replaced by a generated UUID. It is also forwarded upstream and appears in denial logs.
 Allowed responses carry `x-keylease-lease-id` and `x-keylease-calls-remaining`.
 Forwarded upstream requests forward an explicit allowlist of safe request headers (`accept`, `accept-charset`, `accept-encoding`, `accept-language`, `content-type`, `content-encoding`, `content-language`, `range`, `user-agent`, and conditional `if-*` headers), plus `authorization` when `KEYLEASE_FORWARD_AUTH=true`. Additional headers can be forwarded by configuring `KEYLEASE_FORWARD_HEADERS`. Hop-by-hop headers, client-supplied `x-keylease-*` headers, and `x-forwarded-*` headers are stripped to prevent spoofing; proxy metadata is set explicitly.

@@ -8,6 +8,7 @@ import {
   envCommand,
   envEntriesFor,
   fileSessionStore,
+  formatTokenAmount,
   mergeEnv,
   parseConsumerSecret,
   selectLease,
@@ -15,6 +16,7 @@ import {
   SessionStoreError,
   type LeaseSession,
 } from './lease.js';
+import { ContractCallError } from '../client/soroban.js';
 import { verifySessionToken } from '../token.js';
 import type { CliIo } from '../index.js';
 
@@ -1312,5 +1314,63 @@ describe('fileSessionStore', () => {
     await expect(fileSessionStore(dir).load()).rejects.toThrow(
       /Cannot read session store.*missing.*keylease acquire/,
     );
+  });
+});
+
+describe('formatTokenAmount', () => {
+  it('renders smallest units as trimmed XLM', () => {
+    expect(formatTokenAmount(10_000_000)).toBe('1 XLM');
+    expect(formatTokenAmount(1_500_000)).toBe('0.15 XLM');
+    expect(formatTokenAmount(1)).toBe('0.0000001 XLM');
+    expect(formatTokenAmount(0)).toBe('0 XLM');
+  });
+});
+
+describe('quoteCommand', () => {
+  it('prices a call batch in smallest units and XLM', async () => {
+    const { io, out } = captureIo();
+    const seen: Array<{ service: string; calls: number }> = [];
+
+    const code = await quoteCommand({ service: 'weather-api', calls: 3, json: false }, io, {
+      createClient: () => ({
+        quote: async (service, calls) => {
+          seen.push({ service, calls });
+          return 4_500_000;
+        },
+      }),
+    });
+
+    expect(code).toBe(0);
+    expect(seen).toEqual([{ service: 'weather-api', calls: 3 }]);
+    expect(out.join('\n')).toContain('4500000');
+    expect(out.join('\n')).toContain('0.45 XLM');
+  });
+
+  it('supports --json output including the asset', async () => {
+    const { io, out } = captureIo();
+    const code = await quoteCommand({ service: 'weather-api', calls: 2, json: true }, io, {
+      createClient: () => ({ quote: async () => 2_000_000 }),
+    });
+
+    expect(code).toBe(0);
+    expect(JSON.parse(out.join('\n'))).toEqual({
+      service: 'weather-api',
+      calls: 2,
+      price: 2_000_000,
+      asset: 'XLM',
+    });
+  });
+
+  it('surfaces an unknown service as Error(Contract, #3)', async () => {
+    const { io } = captureIo();
+    await expect(
+      quoteCommand({ service: 'ghost-api', calls: 1, json: false }, io, {
+        createClient: () => ({
+          quote: async () => {
+            throw new ContractCallError('quote', 3, 'host invocation failed');
+          },
+        }),
+      }),
+    ).rejects.toMatchObject({ name: 'ContractCallError', method: 'quote', code: 3 });
   });
 });
