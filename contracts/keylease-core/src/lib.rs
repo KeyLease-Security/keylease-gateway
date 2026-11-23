@@ -141,6 +141,31 @@ pub struct ContractUpdated {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Split escrow between consumed and unused calls.
+///
+/// The payout is rounded down toward the provider, so the unused refund receives
+/// any remainder and `payable + refund == price_paid` always holds.
+fn calculate_payout(
+    price_paid: i128,
+    calls_used: u32,
+    calls_limit: u32,
+) -> Result<(i128, i128), Error> {
+    if calls_limit == 0 {
+        return Err(Error::InvalidAmount);
+    }
+    let payable = price_paid
+        .checked_mul(calls_used as i128)
+        .and_then(|amount| amount.checked_div(calls_limit as i128))
+        .ok_or(Error::InvalidAmount)?;
+    let refund = price_paid
+        .checked_sub(payable)
+        .ok_or(Error::InvalidAmount)?;
+    if payable.checked_add(refund) != Some(price_paid) {
+        return Err(Error::InvalidAmount);
+    }
+    Ok((payable, refund))
+}
+
 #[contract]
 pub struct KeyleaseCore;
 
@@ -599,9 +624,17 @@ impl KeyleaseCore {
             return Err(Error::AlreadySettled);
         }
         let config = load_config(&env)?;
-        let (_payable, refund) =
-            calculate_payout(lease.price_paid, lease.calls_used, lease.calls_limit);
+        let (payable, refund) =
+            calculate_payout(lease.price_paid, lease.calls_used, lease.calls_limit)?;
 
+        if payable > 0 {
+            let contract_address = env.current_contract_address();
+            token::Client::new(&env, &config.token).transfer(
+                &contract_address,
+                &lease.provider,
+                &payable,
+            );
+        }
         if refund > 0 {
             let contract_address = env.current_contract_address();
             token::Client::new(&env, &config.token).transfer(
@@ -652,7 +685,7 @@ impl KeyleaseCore {
         let escrow = env.current_contract_address();
 
         let (payable, refund) =
-            calculate_payout(lease.price_paid, lease.calls_used, lease.calls_limit);
+            calculate_payout(lease.price_paid, lease.calls_used, lease.calls_limit)?;
 
         if payable > 0 {
             token_client.transfer(&escrow, &lease.provider, &payable);
