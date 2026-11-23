@@ -166,3 +166,21 @@ jobs:
           path: ${{ runner.temp }}/pnpm-audit.txt
           if-no-files-found: ignore
           retention-days: 30
+
+  rust-advisories:
+    name: contract · advisories · cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check Rust advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+          manifest-path: contracts/keylease-core/Cargo.toml
+          config: contracts/keylease-core/deny.toml

@@ -1,7 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
-import { OnChainQuota, QuotaCapacityWarning, type CallCommitter } from './quota.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { OnChainQuota, type CallCommitter } from './quota.js';
+import { OnChainQuota, QuotaCapacityWarning, type CallCommitter } from './quota.js';
 
 afterEach(() => {
   vi.useRealTimers();

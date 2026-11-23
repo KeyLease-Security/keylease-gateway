@@ -1,5 +1,7 @@
 import { Keypair } from '@stellar/stellar-sdk';
 import { describe, expect, it } from 'vitest';
+import { acquireCommand, type LeaseSession, type SessionStore } from './commands/lease.js';
+import type { CliIo } from './index.js';
 import {
   SESSION_TOKEN_PREFIX,
   TokenVerificationError,
@@ -171,5 +173,209 @@ describe('verifySessionToken', () => {
       () => verifySessionToken(mint(), { now: NOW, expectedConsumer: OTHER.publicKey() }),
       'consumer_mismatch',
     );
+  });
+});
+
+/** Signs an arbitrary payload exactly like `mintSessionToken` does. */
+function signRaw(payload: Record<string, unknown>, signer: Keypair = consumer): string {
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const signature = Buffer.from(signer.sign(Buffer.from(encoded, 'utf8'))).toString('base64url');
+  return `${SESSION_TOKEN_PREFIX}.${encoded}.${signature}`;
+}
+
+/** A v1 token as minted before the `service` claim existed. */
+function legacyToken(): string {
+  return signRaw({
+    v: 1,
+    lease_id: 'lease-abc',
+    consumer: consumer.publicKey(),
+    iat: NOW,
+    exp: NOW + 300,
+  });
+}
+
+describe('service binding', () => {
+  it('mints the service claim when a service is given', () => {
+    const { payload } = parseSessionToken(mint({ service: 'weather-api' }));
+    expect(payload.service).toBe('weather-api');
+    expect(payload.v).toBe(1);
+  });
+
+  it('omits the claim entirely when no service is given (legacy payload shape)', () => {
+    const { payload } = parseSessionToken(mint());
+    expect('service' in payload).toBe(false);
+    expect(Object.keys(payload).sort()).toEqual(['consumer', 'exp', 'iat', 'lease_id', 'v']);
+  });
+
+  it('rejects an empty service when minting', () => {
+    expectCode(() => mint({ service: '' }), 'malformed_token');
+  });
+
+  it('verifies a legacy v1 token without the claim, with or without an expected service', () => {
+    const token = legacyToken();
+    expect(verifySessionToken(token, { now: NOW }).service).toBeUndefined();
+    const payload = verifySessionToken(token, { now: NOW, expectedService: 'weather-api' });
+    expect(payload.lease_id).toBe('lease-abc');
+    expect(payload.service).toBeUndefined();
+  });
+
+  it('accepts a token whose service matches the expected service', () => {
+    const payload = verifySessionToken(mint({ service: 'weather-api' }), {
+      now: NOW,
+      expectedService: 'weather-api',
+    });
+    expect(payload.service).toBe('weather-api');
+  });
+
+  it('accepts a service-bound token when no expected service is given', () => {
+    expect(verifySessionToken(mint({ service: 'weather-api' }), { now: NOW }).service).toBe(
+      'weather-api',
+    );
+  });
+
+  it('rejects a cross-service token with service_mismatch', () => {
+    const token = mint({ service: 'weather-api' });
+    expectCode(
+      () => verifySessionToken(token, { now: NOW, expectedService: 'maps-api' }),
+      'service_mismatch',
+    );
+    try {
+      verifySessionToken(token, { now: NOW, expectedService: 'maps-api' });
+    } catch (error) {
+      expect(error).toBeInstanceOf(TokenVerificationError);
+      expect((error as TokenVerificationError).message).toMatch(/service/);
+    }
+  });
+
+  it('checks the signature before the service binding', () => {
+    // A forged claim signed by the wrong key is a bad signature, not a mismatch.
+    const forged = signRaw(
+      {
+        v: 1,
+        lease_id: 'lease-abc',
+        consumer: consumer.publicKey(),
+        iat: NOW,
+        exp: NOW + 300,
+        service: 'maps-api',
+      },
+      OTHER,
+    );
+    expectCode(
+      () => verifySessionToken(forged, { now: NOW, expectedService: 'weather-api' }),
+      'bad_signature',
+    );
+  });
+
+  it('cannot be rebound to another service without breaking the signature', () => {
+    const [prefix, encoded, signature] = mint({ service: 'weather-api' }).split('.') as [
+      string,
+      string,
+      string,
+    ];
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+    payload['service'] = 'maps-api';
+    const tampered = `${prefix}.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.${signature}`;
+    expectCode(
+      () => verifySessionToken(tampered, { now: NOW, expectedService: 'maps-api' }),
+      'bad_signature',
+    );
+  });
+
+  it('rejects a non-string or empty service claim as malformed', () => {
+    for (const service of [42, '', null]) {
+      const token = signRaw({
+        v: 1,
+        lease_id: 'lease-abc',
+        consumer: consumer.publicKey(),
+        iat: NOW,
+        exp: NOW + 300,
+        service,
+      });
+      expectCode(() => parseSessionToken(token), 'malformed_token');
+    }
+  });
+
+  it('keeps the existing lease and consumer checks alongside the service check', () => {
+    const token = mint({ service: 'weather-api' });
+    expectCode(
+      () =>
+        verifySessionToken(token, {
+          now: NOW,
+          expectedLeaseId: 'lease-other',
+          expectedService: 'weather-api',
+        }),
+      'lease_mismatch',
+    );
+    expectCode(() => verifySessionToken(token, { now: NOW + 301, expectedService: 'weather-api' }), 'token_expired');
+  });
+});
+
+describe('acquire populates the service claim', () => {
+  function memoryStore(): SessionStore & { saved: LeaseSession[] } {
+    const saved: LeaseSession[] = [];
+    return {
+      saved,
+      async load() {
+        return {};
+      },
+      async save(session) {
+        saved.push(session);
+      },
+      async saveAll() {},
+    };
+  }
+
+  it('binds the minted token to the --service the lease was created for', async () => {
+    const store = memoryStore();
+    const created: string[] = [];
+    const out: string[] = [];
+    const io: CliIo = { out: (line) => out.push(line), err: () => undefined };
+
+    const code = await acquireCommand(
+      {
+        service: 'weather-api',
+        calls: 10,
+        duration: 300,
+        secret: consumer.secret(),
+        dryRun: false,
+        json: true,
+      },
+      io,
+      {
+        store,
+        now: () => NOW * 1000,
+        createClient: () => ({
+          async createLease(input) {
+            created.push(input.service);
+            return { leaseId: '42', txHash: 'tx-hash' };
+          },
+          async quote() {
+            return 0;
+          },
+        }),
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(created).toEqual(['weather-api']);
+    expect(store.saved).toHaveLength(1);
+    const session = store.saved[0] as LeaseSession;
+    expect(session.service).toBe('weather-api');
+
+    const payload = verifySessionToken(session.token, {
+      now: NOW,
+      expectedLeaseId: '42',
+      expectedConsumer: consumer.publicKey(),
+      expectedService: 'weather-api',
+    });
+    expect(payload.service).toBe('weather-api');
+    expectCode(
+      () => verifySessionToken(session.token, { now: NOW, expectedService: 'maps-api' }),
+      'service_mismatch',
+    );
+    expect(JSON.parse(out.join('\n')).session_token).toBe(session.token);
   });
 });

@@ -1,0 +1,12 @@
+# Core Soroban contract: services, prepaid leases, escrow, and quota management
+/contracts/ @Oyinkans0la12
+
+# CI/CD workflows, automation, and security scanning configurations
+/.github/workflows/ @Oyinkans0la12
+
+# Vulnerability disclosure policies and security guidelines
+/SECURITY.md @Oyinkans0la12
+
+# Edge proxy token verification and on-chain quota settlement modules
+/packages/proxy/src/verifier.ts @Oyinkans0la12
+/packages/proxy/src/quota.ts @Oyinkans0la12

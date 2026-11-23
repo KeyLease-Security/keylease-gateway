@@ -1,0 +1,10 @@
+# Known-flaky hosts, bot-blocked explorers, and template placeholders
+
+# stellar.expert blocks headless scrapers and CI runners via Cloudflare anti-bot challenges
+https://stellar.expert/.*
+
+# shields.io dynamic badge servers occasionally rate-limit CI runners
+https://img.shields.io/.*
+
+# Placeholder links in documentation templates
+https://github.com/KeyLease-Security/keylease-gateway/pull/.*

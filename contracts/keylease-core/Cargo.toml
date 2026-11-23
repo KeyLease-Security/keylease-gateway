@@ -1,7 +1,7 @@
 [package]
 name = "keylease-core"
 description = "Soroban lease registry: services, prepaid API leases, on-chain quota, escrow settlement."
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 publish = false

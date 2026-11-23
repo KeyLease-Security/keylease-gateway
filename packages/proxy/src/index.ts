@@ -12,9 +12,11 @@
  *   KEYLEASE_CONTRACT_ID     keylease-core contract id (required)
  *   KEYLEASE_GATEWAY_SECRET  Stellar seed of the registered gateway account;
  *                            enables on-chain `use_call` quota commits
- *   KEYLEASE_QUOTA_BATCH     calls buffered before a commit (default: 50, max: 10000)
- *   KEYLEASE_QUOTA_FLUSH_MS  periodic commit interval (default: 10000, max: 300000)
- *   KEYLEASE_CACHE_TTL_MS    lease-state cache TTL (default: 30000, max: 300000)
+ *   KEYLEASE_QUOTA_BATCH     calls buffered before a commit (default: 50)
+ *   KEYLEASE_QUOTA_FLUSH_MS  periodic commit interval (default: 10000)
+ *   KEYLEASE_CACHE_TTL_MS    lease-state cache TTL (default: 30000)
+ *   KEYLEASE_UPSTREAM_TIMEOUT_MS per-request upstream timeout in ms; 0 disables
+ *                            (default: 15000)
  *   KEYLEASE_MAX_BODY_BYTES  maximum request body size in bytes (default: 33554432)
  *   KEYLEASE_KEEP_ALIVE_TIMEOUT_MS inbound socket keep-alive window (default: 72000)
  *   KEYLEASE_REQUEST_TIMEOUT_MS    deadline to receive a whole request (default: 300000);
@@ -28,6 +30,7 @@
  *   KEYLEASE_MAX_INFLIGHT    max concurrent proxied requests; excess get 503 + Retry-After
  *                            (default: 1024, 0 disables)
  *   KEYLEASE_FORWARD_AUTH    "true" to forward the caller's bearer token
+ *   KEYLEASE_FORWARD_HEADERS comma-separated additional request header names to forward
  *   KEYLEASE_METRICS_ENABLED "true" to expose Prometheus metrics on /metrics (default: false)
  *   KEYLEASE_SHUTDOWN_TIMEOUT_MS shutdown drain timeout in ms (default: 10000)
  *   PORT / HOST              listen address (default: 8080 / 0.0.0.0)
@@ -37,12 +40,10 @@ import { Keypair } from '@stellar/stellar-sdk';
 import { SorobanClient } from '@keylease/cli/soroban';
 import {
   buildProxyServer,
-  DEFAULT_CORS_ALLOWED_HEADERS,
-  DEFAULT_CORS_ALLOWED_METHODS,
   DEFAULT_MAX_IN_FLIGHT,
+  DEFAULT_REQUEST_TIMEOUT_MS,
   drainProxyServer,
 } from './server.js';
-import type { ResolvedCorsOptions } from './server.js';
 import { LeaseVerifier, type LeaseStateProvider } from './verifier.js';
 import { OnChainQuota, QuotaCapacityWarning, type QuotaSink } from './quota.js';
 
@@ -60,18 +61,18 @@ export interface ProxyEnv {
   KEYLEASE_QUOTA_BATCH?: string | undefined;
   KEYLEASE_QUOTA_FLUSH_MS?: string | undefined;
   KEYLEASE_CACHE_TTL_MS?: string | undefined;
+  KEYLEASE_UPSTREAM_TIMEOUT_MS?: string | undefined;
   KEYLEASE_TRUST_PROXY?: string | undefined;
   KEYLEASE_FORWARD_AUTH?: string | undefined;
+  KEYLEASE_FORWARD_HEADERS?: string | undefined;
   KEYLEASE_METRICS_ENABLED?: string | undefined;
   KEYLEASE_SHUTDOWN_TIMEOUT_MS?: string | undefined;
   KEYLEASE_MAX_BODY_BYTES?: string | undefined;
   KEYLEASE_MAX_INFLIGHT?: string | undefined;
-  KEYLEASE_KEEP_ALIVE_TIMEOUT_MS?: string | undefined;
-  KEYLEASE_REQUEST_TIMEOUT_MS?: string | undefined;
-  KEYLEASE_CORS_ALLOWED_ORIGINS?: string | undefined;
-  KEYLEASE_CORS_ALLOWED_HEADERS?: string | undefined;
-  KEYLEASE_CORS_ALLOW_CREDENTIALS?: string | undefined;
-  KEYLEASE_CORS_MAX_AGE_SECONDS?: string | undefined;
+  KEYLEASE_SERVICE_ID?: string | undefined;
+  KEYLEASE_RATE_LIMIT_PER_MINUTE?: string | undefined;
+  KEYLEASE_CIRCUIT_BREAKER_THRESHOLD?: string | undefined;
+  KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS?: string | undefined;
   PORT?: string | undefined;
   HOST?: string | undefined;
 }
@@ -88,7 +89,10 @@ export interface ResolvedConfig {
   host: string;
   port: number;
   cacheTtlMs: number;
+  /** Per-request upstream timeout in milliseconds; 0 disables it. */
+  requestTimeoutMs: number;
   forwardAuthorization: boolean;
+  forwardHeaders: string[];
   trustProxy: boolean | number | string[];
   metricsEnabled: boolean;
   shutdownTimeoutMs: number;
@@ -97,9 +101,10 @@ export interface ResolvedConfig {
   quotaFlushMs: number;
   maxBodyBytes: number;
   maxInFlight: number;
-  keepAliveTimeoutMs: number;
-  requestTimeoutMs: number;
-  cors: ResolvedCorsOptions;
+  serviceId?: string | undefined;
+  rateLimitPerMinute: number;
+  circuitBreakerThreshold: number;
+  circuitBreakerCooldownMs: number;
 }
 
 export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024; // 32 MiB
@@ -144,52 +149,13 @@ function boundedInt(
   return value;
 }
 
-/** Parses a comma-separated CORS origin allowlist; `*` must be used alone. */
-function parseCorsOrigins(raw: string | undefined): string[] {
-  const value = raw?.trim();
-  if (value === undefined || value === '') return [CORS_ORIGIN_WILDCARD];
-  const entries = value
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-  if (entries.includes(CORS_ORIGIN_WILDCARD) && entries.length > 1) {
-    throw new ProxyConfigError(
-      'KEYLEASE_CORS_ALLOWED_ORIGINS "*" cannot be combined with explicit origins',
-    );
+function nonNegativeInt(raw: string | undefined, fallback: number, name: string): number {
+  if (raw === undefined) return fallback;
+  const value = raw.trim() === '' ? Number.NaN : Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new ProxyConfigError(`${name} "${raw}" must be a non-negative integer (0 disables it)`);
   }
-  return entries.map((entry) => {
-    if (entry === CORS_ORIGIN_WILDCARD) return entry;
-    try {
-      return new URL(entry).origin;
-    } catch {
-      throw new ProxyConfigError(
-        `KEYLEASE_CORS_ALLOWED_ORIGINS entry "${entry}" must be "*" or an absolute origin like "https://app.example.com"`,
-      );
-    }
-  });
-}
-
-/** Parses a comma-separated request-header allowlist for preflight responses. */
-function parseCorsHeaders(raw: string | undefined): string[] {
-  const value = raw?.trim();
-  if (value === undefined || value === '') return [...DEFAULT_CORS_ALLOWED_HEADERS];
-  const entries = value
-    .split(',')
-    .map((entry) => entry.trim().toLowerCase())
-    .filter((entry) => entry.length > 0);
-  if (entries.includes(CORS_ORIGIN_WILDCARD) && entries.length > 1) {
-    throw new ProxyConfigError(
-      'KEYLEASE_CORS_ALLOWED_HEADERS "*" cannot be combined with explicit headers',
-    );
-  }
-  for (const entry of entries) {
-    if (entry !== CORS_ORIGIN_WILDCARD && !CORS_HEADER_TOKEN.test(entry)) {
-      throw new ProxyConfigError(
-        `KEYLEASE_CORS_ALLOWED_HEADERS entry "${entry}" is not a valid HTTP header name`,
-      );
-    }
-  }
-  return entries;
+  return value;
 }
 
 function parseTrustProxy(raw: string | undefined): boolean | number | string[] {
@@ -207,6 +173,14 @@ function parseTrustProxy(raw: string | undefined): boolean | number | string[] {
     );
   }
   return entries;
+}
+
+function parseForwardHeaders(raw: string | undefined): string[] {
+  if (raw === undefined || raw.trim() === '') return [];
+  return raw
+    .split(',')
+    .map((name) => name.trim().toLowerCase())
+    .filter((name) => name.length > 0);
 }
 
 export function resolveConfig(env: ProxyEnv): ResolvedConfig {
@@ -246,45 +220,39 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     );
   }
 
-  const keepAliveTimeoutMs = boundedInt(
-    env.KEYLEASE_KEEP_ALIVE_TIMEOUT_MS,
-    DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
-    'KEYLEASE_KEEP_ALIVE_TIMEOUT_MS',
-    { max: MAX_KEEP_ALIVE_TIMEOUT_MS },
-  );
-  const requestTimeoutMs = boundedInt(
-    env.KEYLEASE_REQUEST_TIMEOUT_MS,
-    DEFAULT_REQUEST_TIMEOUT_MS,
-    'KEYLEASE_REQUEST_TIMEOUT_MS',
-    { max: MAX_REQUEST_TIMEOUT_MS },
+  const rawServiceId = env.KEYLEASE_SERVICE_ID?.trim();
+  const serviceId = rawServiceId && rawServiceId.length > 0 ? rawServiceId : undefined;
+
+  const rateLimitPerMinute = nonNegativeInt(
+    env.KEYLEASE_RATE_LIMIT_PER_MINUTE,
+    0,
+    'KEYLEASE_RATE_LIMIT_PER_MINUTE',
   );
 
-  const corsOrigins = parseCorsOrigins(env.KEYLEASE_CORS_ALLOWED_ORIGINS);
-  const corsAllowCredentials = env.KEYLEASE_CORS_ALLOW_CREDENTIALS === 'true';
-  if (corsAllowCredentials && corsOrigins.includes(CORS_ORIGIN_WILDCARD)) {
-    throw new ProxyConfigError(
-      'KEYLEASE_CORS_ALLOW_CREDENTIALS requires explicit KEYLEASE_CORS_ALLOWED_ORIGINS (a wildcard origin cannot be combined with credentials)',
-    );
-  }
-  const cors: ResolvedCorsOptions = {
-    allowedOrigins: corsOrigins,
-    allowedHeaders: parseCorsHeaders(env.KEYLEASE_CORS_ALLOWED_HEADERS),
-    allowedMethods: [...DEFAULT_CORS_ALLOWED_METHODS],
-    allowCredentials: corsAllowCredentials,
-    maxAgeSeconds: boundedInt(
-      env.KEYLEASE_CORS_MAX_AGE_SECONDS,
-      DEFAULT_CORS_MAX_AGE_SECONDS,
-      'KEYLEASE_CORS_MAX_AGE_SECONDS',
-      { min: 0, max: MAX_CORS_MAX_AGE_SECONDS },
-    ),
-  };
+  const circuitBreakerThreshold = nonNegativeInt(
+    env.KEYLEASE_CIRCUIT_BREAKER_THRESHOLD,
+    5,
+    'KEYLEASE_CIRCUIT_BREAKER_THRESHOLD',
+  );
+
+  const circuitBreakerCooldownMs = positiveInt(
+    env.KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS,
+    30_000,
+    'KEYLEASE_CIRCUIT_BREAKER_COOLDOWN_MS',
+  );
 
   return {
     upstream,
     host: env.HOST ?? '0.0.0.0',
     port,
     cacheTtlMs,
+    requestTimeoutMs: nonNegativeInt(
+      env.KEYLEASE_UPSTREAM_TIMEOUT_MS,
+      DEFAULT_REQUEST_TIMEOUT_MS,
+      'KEYLEASE_UPSTREAM_TIMEOUT_MS',
+    ),
     forwardAuthorization: env.KEYLEASE_FORWARD_AUTH === 'true',
+    forwardHeaders: parseForwardHeaders(env.KEYLEASE_FORWARD_HEADERS),
     trustProxy: parseTrustProxy(env.KEYLEASE_TRUST_PROXY),
     metricsEnabled: env.KEYLEASE_METRICS_ENABLED === 'true',
     shutdownTimeoutMs: boundedInt(
@@ -301,9 +269,10 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     }),
     maxBodyBytes,
     maxInFlight,
-    keepAliveTimeoutMs,
-    requestTimeoutMs,
-    cors,
+    serviceId,
+    rateLimitPerMinute,
+    circuitBreakerThreshold,
+    circuitBreakerCooldownMs,
   };
 }
 
@@ -319,7 +288,9 @@ export function describeConfig(config: ResolvedConfig): Record<string, unknown> 
     host: config.host,
     port: config.port,
     cacheTtlMs: config.cacheTtlMs,
+    requestTimeoutMs: config.requestTimeoutMs,
     forwardAuthorization: config.forwardAuthorization,
+    forwardHeaders: config.forwardHeaders,
     trustProxy: config.trustProxy,
     metricsEnabled: config.metricsEnabled,
     shutdownTimeoutMs: config.shutdownTimeoutMs,
@@ -328,15 +299,10 @@ export function describeConfig(config: ResolvedConfig): Record<string, unknown> 
     quotaFlushMs: config.quotaFlushMs,
     maxBodyBytes: config.maxBodyBytes,
     maxInFlight: config.maxInFlight,
-    keepAliveTimeoutMs: config.keepAliveTimeoutMs,
-    requestTimeoutMs: config.requestTimeoutMs,
-    cors: {
-      allowedOrigins: config.cors.allowedOrigins,
-      allowedHeaders: config.cors.allowedHeaders,
-      allowedMethods: config.cors.allowedMethods,
-      allowCredentials: config.cors.allowCredentials,
-      maxAgeSeconds: config.cors.maxAgeSeconds,
-    },
+    serviceId: config.serviceId ?? null,
+    rateLimitPerMinute: config.rateLimitPerMinute,
+    circuitBreakerThreshold: config.circuitBreakerThreshold,
+    circuitBreakerCooldownMs: config.circuitBreakerCooldownMs,
   };
 }
 
@@ -440,19 +406,22 @@ export async function startProxy(env: ProxyEnv = process.env): Promise<{
   const verifier = new LeaseVerifier({
     provider: providerFromClient(client),
     cacheTtlMs: config.cacheTtlMs,
+    serviceId: config.serviceId,
+    rateLimitPerMinute: config.rateLimitPerMinute,
     ...(quotaSink === undefined ? {} : { quotaSink }),
   });
   const app = buildProxyServer({
     upstream: config.upstream,
     verifier,
     forwardAuthorization: config.forwardAuthorization,
+    forwardHeaders: config.forwardHeaders,
     trustProxy: config.trustProxy,
     metricsEnabled: config.metricsEnabled,
+    requestTimeoutMs: config.requestTimeoutMs,
     maxBodyBytes: config.maxBodyBytes,
     maxInFlight: config.maxInFlight,
-    keepAliveTimeoutMs: config.keepAliveTimeoutMs,
-    incomingRequestTimeoutMs: config.requestTimeoutMs,
-    cors: config.cors,
+    circuitBreakerThreshold: config.circuitBreakerThreshold,
+    circuitBreakerCooldownMs: config.circuitBreakerCooldownMs,
     logger: true,
   });
   app.log.info({ config: describeConfig(config) }, 'configuration');

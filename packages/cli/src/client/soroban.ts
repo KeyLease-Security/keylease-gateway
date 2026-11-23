@@ -100,6 +100,7 @@ export interface ServiceState {
   provider: string;
   pricePerCall: number;
   active: boolean;
+  leaseCount?: number;
 }
 
 export interface CreateLeaseParams {
@@ -152,12 +153,20 @@ export class LeaseNotFoundError extends SorobanError {
 export class ContractCallError extends SorobanError {
   readonly code: number | null;
   readonly method: string;
+  /** Raw error detail from the contract for machine-readable output (--json). */
+  readonly detail: string;
 
   constructor(method: string, code: number | null, detail: string) {
-    super(`keylease-core.${method} failed${code === null ? '' : ` with Error(${code})`}: ${detail}`);
+    const errorInfo = mapContractError(code);
+    const codeStr = code === null ? 'unknown' : String(code);
+    const message =
+      `keylease-core.${method} failed with Error(${codeStr}): ${errorInfo.message}\n` +
+      `Next step: ${errorInfo.nextStep}`;
+    super(message);
     this.name = 'ContractCallError';
     this.method = method;
     this.code = code;
+    this.detail = detail;
   }
 }
 
@@ -165,6 +174,10 @@ export interface SorobanClientOptions {
   server: SorobanRpc;
   contractId: string;
   networkPassphrase: string;
+  /** Transaction inclusion fee in stroops. Defaults to the SDK base fee. */
+  fee?: number;
+  /** Envelope timeout in seconds. Defaults to 60 seconds. */
+  timeout?: number;
   txPollAttempts?: number;
   txPollIntervalMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -238,11 +251,14 @@ export function parseServiceState(value: xdr.ScVal): ServiceState {
   if (typeof service !== 'string') {
     throw new SorobanError('service field "service" must be a string');
   }
+  const rawCount = raw['lease_count'];
+  const leaseCount = typeof rawCount === 'number' || typeof rawCount === 'bigint' ? Number(rawCount) : 0;
   return {
     service,
     provider: requireAddress(raw['provider'], 'provider'),
     pricePerCall: requireFiniteNumber(raw['price_per_call'], 'price_per_call'),
     active: Boolean(raw['active']),
+    leaseCount,
   };
 }
 
@@ -292,13 +308,16 @@ export function encodeLeaseState(state: LeaseState): xdr.ScVal {
   ]);
 }
 
-/** Validates the decimal `u64` lease id used on chain and in bearer tokens. */
+/** Validates the canonical decimal `u64` lease id used on chain and in bearer tokens.
+ *  Requires the canonical form: 0, or [1-9] followed by optional digits.
+ *  Rejects leading zeros (e.g., 00, 007) to avoid lease id collisions in comparisons and logs.
+ */
 export function parseLeaseId(leaseId: string): bigint {
-  if (!/^[0-9]+$/.test(leaseId)) {
-    throw new SorobanError(`lease id "${leaseId}" must be a decimal u64`);
+  if (!/^(0|[1-9][0-9]*)$/.test(leaseId)) {
+    throw new SorobanError(`lease id "${leaseId}" must be in canonical decimal form (0 or [1-9][0-9]*)`);
   }
   const value = BigInt(leaseId);
-  if (value <= 0n || value > 0xffff_ffff_ffff_ffffn) {
+  if (value > 0xffff_ffff_ffff_ffffn) {
     throw new SorobanError(`lease id "${leaseId}" is out of the u64 range`);
   }
   return value;
@@ -309,18 +328,122 @@ function contractErrorCode(detail: string): number | null {
   return match?.[1] === undefined ? null : Number(match[1]);
 }
 
+/**
+ * Maps contract error codes to human-readable messages with actionable next steps.
+ * See: https://github.com/KeyLease-Security/keylease-gateway#contract-reference
+ */
+export interface ErrorMessage {
+  /** Human-readable error summary. */
+  message: string;
+  /** Suggested next step or resolution. */
+  nextStep: string;
+}
+
+export function mapContractError(code: number | null): ErrorMessage {
+  switch (code) {
+    case 1:
+      return {
+        message: 'Contract initialization has already been performed',
+        nextStep: 'This error typically indicates a contract deployment issue. Contact the operator.',
+      };
+    case 2:
+      return {
+        message: 'Contract has not been initialized',
+        nextStep: 'The contract may be misconfigured. Verify KEYLEASE_CONTRACT_ID and contact the operator.',
+      };
+    case 3:
+      return {
+        message: 'Service was never registered',
+        nextStep: 'Check your --service name. The provider may need to register this service first.',
+      };
+    case 4:
+      return {
+        message: 'Service is paused by its provider',
+        nextStep: 'The provider has temporarily disabled this service. Contact them to re-enable it.',
+      };
+    case 5:
+      return {
+        message: 'Lease does not exist on chain',
+        nextStep: 'Check your --lease id. You may need to acquire a new lease with "keylease acquire".',
+      };
+    case 6:
+      return {
+        message: 'Lease is inactive (revoked or already settled)',
+        nextStep: 'This lease has already been closed. Acquire a new lease to continue.',
+      };
+    case 7:
+      return {
+        message: 'Lease has expired',
+        nextStep: 'Wait for settlement or contact the provider. Run "keylease settle" to finalize the lease.',
+      };
+    case 8:
+      return {
+        message: 'Lease cannot be settled yet',
+        nextStep: 'Settlement is only possible once the lease expires or runs out of calls. Wait for expiry or exhaust the quota.',
+      };
+    case 9:
+      return {
+        message: 'Escrow has already been paid out',
+        nextStep: 'This lease was already settled. The payout cannot be made twice.',
+      };
+    case 10:
+      return {
+        message: 'Call count is invalid (must be positive)',
+        nextStep: 'Ensure --calls is a positive integer.',
+      };
+    case 11:
+      return {
+        message: 'Duration is invalid (must be positive)',
+        nextStep: 'Ensure --duration is a positive integer in seconds.',
+      };
+    case 12:
+      return {
+        message: 'Price per call is invalid (must be positive)',
+        nextStep: 'Contact the operator. The service has an invalid price configuration.',
+      };
+    case 13:
+      return {
+        message: 'Payment amount is invalid',
+        nextStep: 'Ensure you have sufficient funds. Verify your account balance and try again.',
+      };
+    case 14:
+      return {
+        message: 'Operation not authorized',
+        nextStep: 'You do not have permission for this operation. Check that you are using the correct account.',
+      };
+    default:
+      return {
+        message: 'An unknown contract error occurred',
+        nextStep: 'Check the detailed error information below. If the problem persists, contact support.',
+      };
+  }
+}
+
 export class SorobanClient {
   private readonly server: SorobanRpc;
   private readonly contractId: string;
   private readonly networkPassphrase: string;
+  private readonly fee: string;
+  private readonly timeout: number;
   private readonly txPollAttempts: number;
   private readonly txPollIntervalMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(options: SorobanClientOptions) {
+    if (options.fee !== undefined && (!Number.isSafeInteger(options.fee) || options.fee <= 0)) {
+      throw new SorobanError(`transaction fee must be a positive safe integer in stroops, got ${options.fee}`);
+    }
+    if (
+      options.timeout !== undefined &&
+      (!Number.isSafeInteger(options.timeout) || options.timeout <= 0)
+    ) {
+      throw new SorobanError(`transaction timeout must be a positive safe integer in seconds, got ${options.timeout}`);
+    }
     this.server = options.server;
     this.contractId = options.contractId;
     this.networkPassphrase = options.networkPassphrase;
+    this.fee = options.fee === undefined ? BASE_FEE : String(options.fee);
+    this.timeout = options.timeout ?? DEFAULT_TX_TIMEOUT_SECONDS;
     this.txPollAttempts = options.txPollAttempts ?? DEFAULT_TX_POLL_ATTEMPTS;
     this.txPollIntervalMs = options.txPollIntervalMs ?? DEFAULT_TX_POLL_INTERVAL_MS;
     this.sleep = options.sleep ?? defaultSleep;
@@ -334,6 +457,7 @@ export class SorobanClient {
   static fromEnv(
     env: ClientEnv = process.env,
     serverFactory: (url: string) => SorobanRpc = createRpcServer,
+    transactionOptions: Pick<SorobanClientOptions, 'fee' | 'timeout'> = {},
   ): SorobanClient {
     const networkName = env.KEYLEASE_NETWORK ?? 'testnet';
     const network = NETWORKS[networkName];
@@ -357,6 +481,7 @@ export class SorobanClient {
       server: serverFactory(rpcUrl),
       contractId,
       networkPassphrase: network.networkPassphrase,
+      ...transactionOptions,
     });
   }
 
@@ -427,6 +552,34 @@ export class SorobanClient {
     return parseLeaseState(returnValue, leaseId);
   }
 
+  /** Consumer-side release / refund of an expired lease. */
+  async release(
+    leaseId: string,
+    consumer: Keypair,
+  ): Promise<{ leaseId: string; refunded: number; txHash: string; lease: LeaseState }> {
+    const id = parseLeaseId(leaseId);
+    try {
+      const { returnValue, txHash } = await this.invoke({
+        signer: consumer,
+        method: 'revoke_expired_lease',
+        args: [nativeToScVal(id, { type: 'u64' })],
+      });
+      if (!returnValue) throw new SorobanError('revoke_expired_lease returned no lease');
+      const lease = parseLeaseState(returnValue, leaseId);
+      const paidOut =
+        lease.callsLimit === 0
+          ? 0
+          : Math.floor((lease.pricePaid * lease.callsUsed) / lease.callsLimit);
+      const refunded = lease.pricePaid - paidOut;
+      return { leaseId, refunded, txHash, lease };
+    } catch (error) {
+      if (error instanceof ContractCallError && error.code === 5) {
+        throw new LeaseNotFoundError(leaseId);
+      }
+      throw error;
+    }
+  }
+
   /** Provider-side service registration / price update. */
   async registerService(
     provider: Keypair,
@@ -471,6 +624,17 @@ export class SorobanClient {
     return parseServiceState(retval);
   }
 
+  /** Returns a page of registered service IDs by simulating `list_services`. */
+  async listServices(start = 0, limit = 50): Promise<string[]> {
+    const retval = await this.simulate('list_services', [
+      nativeToScVal(start, { type: 'u32' }),
+      nativeToScVal(limit, { type: 'u32' }),
+    ]);
+    const native = scValToNative(retval);
+    if (!Array.isArray(native)) return [];
+    return native.map((s) => String(s));
+  }
+
   /** Price of `calls` calls on `service`, in token smallest units. */
   async quote(service: string, calls: number): Promise<number> {
     if (!Number.isInteger(calls) || calls <= 0) {
@@ -486,7 +650,10 @@ export class SorobanClient {
   /** Runs a read-only contract method through `simulateTransaction`. */
   private async simulate(method: string, args: xdr.ScVal[]): Promise<xdr.ScVal> {
     const transaction = this.build(method, args, SIMULATION_SOURCE, '0');
-    const simulation = await this.server.simulateTransaction(transaction);
+    const simulation = await withRetry(
+      () => this.server.simulateTransaction(transaction),
+      this.sleep,
+    );
     if (rpc.Api.isSimulationError(simulation)) {
       const code = contractErrorCode(simulation.error);
       throw new ContractCallError(method, code, simulation.error);
@@ -510,7 +677,10 @@ export class SorobanClient {
     const prepared = await this.server.prepareTransaction(transaction);
     prepared.sign(params.signer);
 
-    const sent = await this.server.sendTransaction(prepared);
+    const sent = await withRetry(
+      () => this.server.sendTransaction(prepared),
+      this.sleep,
+    );
     if (sent.status === 'ERROR') {
       const detail = transactionResultName(sent.errorResult?.result);
       throw new SorobanError(`${params.method} was rejected by the RPC (${sent.hash}): ${detail}`);
@@ -536,11 +706,11 @@ export class SorobanClient {
     const operation = new Contract(this.contractId).call(method, ...args);
     const account = new Account(source, sequence);
     return new TransactionBuilder(account, {
-      fee: BASE_FEE,
+      fee: this.fee,
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(operation)
-      .setTimeout(DEFAULT_TX_TIMEOUT_SECONDS)
+      .setTimeout(this.timeout)
       .build();
   }
 
@@ -586,6 +756,40 @@ function transactionResultName(result: unknown): string {
   return 'unknown error';
 }
 
+/**
+ * Validates an RPC URL ensuring it is a valid http: or https: URL.
+ * http: is only allowed for local/localhost URLs, matching the SDK's allowHttp rule.
+ *
+ * @throws SorobanError if the URL is invalid or does not meet the scheme requirements
+ */
+export function validateRpcUrl(url: string): void {
+  if (!url.includes('://')) {
+    throw new SorobanError(`invalid RPC URL "${url}": must be a valid URL`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new SorobanError(`invalid RPC URL "${url}": must be a valid URL`);
+  }
+
+  const scheme = parsed.protocol;
+  if (scheme !== 'http:' && scheme !== 'https:') {
+    throw new SorobanError(`invalid RPC URL "${url}": scheme must be http: or https:, got ${scheme}`);
+  }
+
+  // Allow http: only for localhost/127.0.0.1
+  if (scheme === 'http:') {
+    const hostname = parsed.hostname;
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '::1' && hostname !== '[::1]') {
+      throw new SorobanError(
+        `invalid RPC URL "${url}": http: is only allowed for localhost, not ${hostname}`,
+      );
+    }
+  }
+}
+
 function createRpcServer(url: string): SorobanRpc {
+  validateRpcUrl(url);
   return new rpc.Server(url, { allowHttp: url.startsWith('http://') }) as unknown as SorobanRpc;
 }

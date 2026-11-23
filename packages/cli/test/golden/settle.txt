@@ -1,0 +1,2 @@
+LEASE ID  STATUS   PAID OUT  REFUNDED  DETAIL
+17        settled  4000      6000      weather-api

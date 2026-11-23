@@ -5,7 +5,9 @@ import {
   TokenVerificationError,
   type SessionTokenPayload,
 } from '../token.js';
+import { renderError } from '../error-renderer.js';
 import type { CliIo } from '../index.js';
+import { redactToken } from '../errors.js';
 import type { NetworkArgs } from './lease.js';
 
 export interface StatusArgs extends NetworkArgs {
@@ -23,6 +25,8 @@ export interface StatusDeps {
   createClient?: (args: StatusArgs) => Pick<SorobanClient, 'getLeaseState'>;
   leaseStateProvider?: LeaseStateProvider;
   now?: () => number;
+  networkName?: string | undefined;
+  contractId?: string | undefined;
 }
 
 interface CheckResult {
@@ -94,10 +98,14 @@ async function checkTokenOnChain(
   try {
     payload = parseSessionToken(args.token ?? '').payload;
   } catch (error) {
+    if (args.json) {
+      renderError(error, io, true);
+      return 1;
+    }
     const detail =
       error instanceof TokenVerificationError ? error.message : String(error);
     const checks: TokenChainChecks = {
-      signature: { passed: false, detail },
+      signature: { passed: false, detail: redactToken(detail) },
       expiry: { passed: false, detail: 'cannot evaluate an invalid token' },
       ...failedChainChecks('not checked because the token could not be parsed'),
     };
@@ -189,17 +197,21 @@ async function checkTokenOnChain(
 }
 
 function renderState(state: LeaseState, io: CliIo, json: boolean): void {
+  const pricePerCall = state.pricePaid / state.callsLimit;
   if (json) {
-    io.out(JSON.stringify(state, null, 2));
+    io.out(JSON.stringify({ ...state, pricePerCall }, null, 2));
     return;
   }
-  const expired = state.expiresAt <= Math.floor(Date.now() / 1000);
   io.out(`Lease ${state.leaseId}`);
+  if (networkName !== undefined) io.out(`  network    : ${networkName}`);
+  if (contractId !== undefined) io.out(`  contract   : ${contractId}`);
   io.out(`  service    : ${state.service}`);
   io.out(`  provider   : ${state.provider}`);
   io.out(`  consumer   : ${state.consumer}`);
   io.out(`  calls      : ${state.callsUsed}/${state.callsLimit}`);
+  io.out(`  remaining  : ${remainingCalls}`);
   io.out(`  escrow     : ${state.pricePaid} (paid into keylease-core)`);
+  io.out(`  price/call : ${pricePerCall}`);
   io.out(`  expires at : ${new Date(state.expiresAt * 1000).toISOString()}${expired ? ' (expired)' : ''}`);
   io.out(`  active     : ${state.active ? 'yes' : 'no'}`);
   io.out(`  settled    : ${state.settled ? 'yes' : 'no'}`);
@@ -231,12 +243,13 @@ export async function statusCommand(
         io.out('Session token is valid');
         io.out(`  lease id   : ${payload.lease_id}`);
         io.out(`  consumer   : ${payload.consumer}`);
+        if (payload.service !== undefined) io.out(`  service    : ${payload.service}`);
         io.out(`  expires at : ${new Date(payload.exp * 1000).toISOString()} (${expiresIn}s left)`);
       }
       return 0;
     } catch (error) {
       if (error instanceof TokenVerificationError) {
-        io.err(`token verification failed (${error.code}): ${error.message}`);
+        renderError(error, io, args.json);
         return 1;
       }
       throw error;
@@ -250,6 +263,12 @@ export async function statusCommand(
 
   const createClient = deps.createClient ?? defaultCreateClient;
   const state = await createClient(args).getLeaseState(args.lease);
-  renderState(state, io, args.json);
+  
+  // Resolve network name and truncated contract id
+  const networkName = deps.networkName ?? args.network ?? 'testnet';
+  const contractId = deps.contractId ?? args.contract;
+  const contractIdTruncated = contractId ? `${contractId.slice(0, 8)}...${contractId.slice(-8)}` : undefined;
+  
+  renderState(state, io, args.json, networkName, contractIdTruncated);
   return 0;
 }

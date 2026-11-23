@@ -1,0 +1,10 @@
+Lease 17
+  service    : weather-api
+  provider   : <ADDRESS>
+  consumer   : <ADDRESS>
+  calls      : 4/10
+  escrow     : 10000 (paid into keylease-core)
+  price/call : 1000
+  expires at : <TIMESTAMP>
+  active     : yes
+  settled    : no

@@ -48,8 +48,11 @@ describe('sessionsCommand', () => {
 
   it('lists stored sessions in a table and supports JSON output', async () => {
     const store = fileSessionStore(dir);
+    const priced = session('weather-api', 'lease-1', NOW + 60);
+    priced.pricePaid = 10_000;
+    priced.pricePerCall = 1_000;
     await store.saveAll({
-      'weather-api': session('weather-api', 'lease-1', NOW + 60),
+      'weather-api': priced,
       'maps-api': session('maps-api', 'lease-2', NOW - 1),
     });
 
@@ -63,6 +66,8 @@ describe('sessionsCommand', () => {
     expect(table.out.join('\n')).toContain('SERVICE');
     expect(table.out.join('\n')).toContain('weather-api');
     expect(table.out.join('\n')).toContain('lease-1');
+    expect(table.out.join('\n')).toContain('10000');
+    expect(table.out.join('\n')).toContain('1000');
     expect(table.out.join('\n')).toContain('active');
     expect(table.out.join('\n')).toContain('expired');
 
@@ -73,15 +78,22 @@ describe('sessionsCommand', () => {
     });
     expect(JSON.parse(json.out.join('\n'))).toEqual([
       { service: 'maps-api', lease_id: 'lease-2', expires_at: NOW - 1, status: 'expired' },
-      { service: 'weather-api', lease_id: 'lease-1', expires_at: NOW + 60, status: 'active' },
+      {
+        service: 'weather-api',
+        lease_id: 'lease-1',
+        price_paid: 10_000,
+        price_per_call: 1_000,
+        expires_at: NOW + 60,
+        status: 'active',
+      },
     ]);
   });
 
   it('prunes expired sessions and reports the removed count', async () => {
     const store = fileSessionStore(dir);
     await store.saveAll({
-      'expired-api': session('expired-api', 'lease-old', NOW),
-      'active-api': session('active-api', 'lease-current', NOW + 60),
+      'expired-api': [session('expired-api', 'lease-old', NOW)],
+      'active-api': [session('active-api', 'lease-current', NOW + 60)],
     });
     const { io, out } = captureIo();
 
@@ -94,7 +106,7 @@ describe('sessionsCommand', () => {
 
     expect(out).toEqual(['Pruned 1 expired session.']);
     await expect(store.load()).resolves.toEqual({
-      'active-api': session('active-api', 'lease-current', NOW + 60),
+      'active-api': [session('active-api', 'lease-current', NOW + 60)],
     });
   });
 

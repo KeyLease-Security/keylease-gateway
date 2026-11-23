@@ -4,13 +4,9 @@
  * allowed requests to the protected upstream API.
  */
 import { randomUUID } from 'node:crypto';
-import type { Socket } from 'node:net';
-import Fastify, {
-  type ConnectionError,
-  type FastifyInstance,
-  type FastifyReply,
-  type FastifyRequest,
-} from 'fastify';
+import { Readable } from 'node:stream';
+import type { ReadableStream as WebReadableStream } from 'node:stream/web';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import type { LeaseVerifier } from './verifier.js';
 
 /** Headers defined by RFC 9110 that must never be forwarded verbatim. */
@@ -27,57 +23,94 @@ export const HOP_BY_HOP_HEADERS: ReadonlySet<string> = new Set([
   'content-length',
 ]);
 
-/** Browser CORS policy applied to preflight and forwarded responses. */
-export interface CorsOptions {
-  /**
-   * Origins allowed to read responses. `*` allows any origin, but cannot be
-   * combined with `allowCredentials`. Defaults to `["*"]`.
-   */
-  allowedOrigins?: string[];
-  /**
-   * Request header names echoed by preflight responses. Lowercase tokens, or
-   * `*` to echo whatever the browser asked for (non-credentialed requests
-   * only). Defaults to Authorization, Content-Type and X-Request-Id.
-   */
-  allowedHeaders?: string[];
-  /** Methods advertised by preflight responses. Defaults to the routed methods. */
-  allowedMethods?: string[];
-  /** Send `Access-Control-Allow-Credentials: true`. Requires explicit origins. */
-  allowCredentials?: boolean;
-  /** `Access-Control-Max-Age` in seconds. Defaults to 600. */
-  maxAgeSeconds?: number;
+export type CircuitState = 'closed' | 'open' | 'half-open';
+
+export interface CircuitBreakerOptions {
+  /** Consecutive failures before the circuit opens. Defaults to 5; 0 disables. */
+  threshold?: number;
+  /** Cooldown in milliseconds before probing half-open. Defaults to 30s. */
+  cooldownMs?: number;
+  /** Injected clock in milliseconds. Defaults to Date.now. */
+  clock?: () => number;
 }
 
-export interface ResolvedCorsOptions {
-  allowedOrigins: string[];
-  allowedHeaders: string[];
-  allowedMethods: string[];
-  allowCredentials: boolean;
-  maxAgeSeconds: number;
+export class CircuitBreaker {
+  readonly threshold: number;
+  readonly cooldownMs: number;
+  private readonly clock: () => number;
+
+  private state: CircuitState = 'closed';
+  private consecutiveFailures = 0;
+  private openedAt = 0;
+  private probeInFlight = false;
+
+  constructor(options: CircuitBreakerOptions = {}) {
+    this.threshold = options.threshold ?? 5;
+    this.cooldownMs = options.cooldownMs ?? 30_000;
+    this.clock = options.clock ?? Date.now;
+  }
+
+  get consecutiveFailureCount(): number {
+    return this.consecutiveFailures;
+  }
+
+  currentState(): CircuitState {
+    if (this.threshold <= 0) return 'closed';
+    if (this.state === 'open') {
+      const now = this.clock();
+      if (now - this.openedAt >= this.cooldownMs) {
+        this.state = 'half-open';
+        this.probeInFlight = false;
+        return 'half-open';
+      }
+    }
+    return this.state;
+  }
+
+  canAttempt(): boolean {
+    if (this.threshold <= 0) return true;
+    const current = this.currentState();
+    if (current === 'closed') return true;
+    if (current === 'half-open') {
+      if (!this.probeInFlight) {
+        this.probeInFlight = true;
+        return true;
+      }
+      return false;
+    }
+    return false;
+  }
+
+  getRetryAfterSeconds(): number {
+    const now = this.clock();
+    const remainingMs = Math.max(0, this.openedAt + this.cooldownMs - now);
+    return Math.max(1, Math.ceil(remainingMs / 1000));
+  }
+
+  recordSuccess(): void {
+    if (this.threshold <= 0) return;
+    this.consecutiveFailures = 0;
+    this.state = 'closed';
+    this.probeInFlight = false;
+  }
+
+  recordFailure(): void {
+    if (this.threshold <= 0) return;
+    this.consecutiveFailures += 1;
+    this.probeInFlight = false;
+    if (this.state === 'half-open' || this.consecutiveFailures >= this.threshold) {
+      this.state = 'open';
+      this.openedAt = this.clock();
+    }
+  }
+
+  reset(): void {
+    this.state = 'closed';
+    this.consecutiveFailures = 0;
+    this.openedAt = 0;
+    this.probeInFlight = false;
+  }
 }
-
-export const DEFAULT_CORS_ALLOWED_HEADERS: readonly string[] = [
-  'authorization',
-  'content-type',
-  'x-request-id',
-];
-export const DEFAULT_CORS_ALLOWED_METHODS: readonly string[] = [
-  'GET',
-  'HEAD',
-  'POST',
-  'PUT',
-  'PATCH',
-  'DELETE',
-  'OPTIONS',
-];
-export const DEFAULT_CORS_MAX_AGE_SECONDS = 600;
-
-/** Custom headers the browser is allowed to read from proxy responses. */
-export const CORS_EXPOSED_HEADERS: readonly string[] = [
-  'x-request-id',
-  'x-keylease-lease-id',
-  'x-keylease-calls-remaining',
-];
 
 export interface ProxyOptions {
   /** Base URL of the protected API, e.g. `https://api.example.com`. */
@@ -85,10 +118,14 @@ export interface ProxyOptions {
   verifier: LeaseVerifier;
   /** Injectable `fetch` for tests. Defaults to the global fetch. */
   fetchImpl?: typeof fetch;
+  /** Optional allowlist of headers to forward upstream. */
+  allowedHeaders?: ReadonlySet<string> | string[];
   /** Fastify logger toggle. Defaults to `false`. */
   logger?: boolean;
   /** Forward the caller's lease token upstream. Defaults to `false`. */
   forwardAuthorization?: boolean;
+  /** Additional request headers to forward upstream. */
+  forwardHeaders?: Iterable<string> | undefined;
   /** Per-request upstream timeout in milliseconds. Defaults to 15s; 0 disables it. */
   requestTimeoutMs?: number;
   /** Expose Prometheus metrics on /metrics. Defaults to `false`. */
@@ -107,22 +144,19 @@ export interface ProxyOptions {
    * `Retry-After`. Defaults to 1024; 0 disables the cap.
    */
   maxInFlight?: number;
-  /**
-   * Idle keep-alive window for inbound sockets in milliseconds. Passed to
-   * Fastify's `keepAliveTimeout`. When omitted, Fastify's default applies.
-   */
-  keepAliveTimeoutMs?: number;
-  /**
-   * Deadline for receiving an entire inbound request, in milliseconds. Passed
-   * to Fastify's `requestTimeout`; an expired request gets a `408` with a JSON
-   * `request_timeout` body. When omitted, Fastify/Node's default applies.
-   */
-  incomingRequestTimeoutMs?: number;
-  /** CORS policy for browser clients. */
-  cors?: CorsOptions;
+  /** Consecutive failures before opening the upstream circuit breaker (default: 5, 0 disables). */
+  circuitBreakerThreshold?: number;
+  /** Cooldown in ms before circuit breaker transitions to half-open (default: 30000). */
+  circuitBreakerCooldownMs?: number;
+  /** Pre-built CircuitBreaker instance. */
+  circuitBreaker?: CircuitBreaker;
+  /** Injected clock for testing. */
+  clock?: () => number;
 }
 
 export const DEFAULT_MAX_IN_FLIGHT = 1024;
+/** Default per-request upstream timeout; `0` disables it. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 const REQUEST_ID_HEADER = 'x-request-id';
 const VALID_REQUEST_ID = /^[A-Za-z0-9._:~+=/-]{1,128}$/;
@@ -140,6 +174,7 @@ export interface ForwardedRequestInit {
   headers: Record<string, string>;
   body?: Buffer | undefined;
   signal?: AbortSignal | undefined;
+  redirect?: 'error' | 'follow' | 'manual' | undefined;
 }
 
 /** Normalises a relative request URL against the configured upstream. */
@@ -150,25 +185,67 @@ export function resolveUpstreamUrl(upstream: string, rawUrl: string): string {
   return new URL(`${basePath}${path}`, base.origin).toString();
 }
 
+/** Default allowlist of request headers forwarded upstream. */
+export const DEFAULT_FORWARDED_HEADERS: ReadonlySet<string> = new Set([
+  'accept',
+  'accept-charset',
+  'accept-encoding',
+  'accept-language',
+  'content-type',
+  'content-encoding',
+  'content-language',
+  'range',
+  'user-agent',
+]);
+
+/** Returns whether an incoming header name is allowed to be forwarded upstream. */
+export function isAllowedForwardHeader(
+  name: string,
+  extraHeaders?: ReadonlySet<string> | undefined,
+): boolean {
+  const lower = name.toLowerCase();
+  if (DEFAULT_FORWARDED_HEADERS.has(lower)) return true;
+  if (lower.startsWith('if-')) return true;
+  if (extraHeaders?.has(lower)) return true;
+  return false;
+}
+
 /**
- * Copies request headers, dropping hop-by-hop entries (and auth by default).
+ * Copies request headers, allowing only default allowlisted headers, conditional
+ * `if-*` headers, and explicitly configured `forwardHeaders` (and auth when enabled).
  * Multi-valued headers are folded onto a single field line: `; ` for cookies
  * (RFC 6265), `, ` for everything else.
  */
 export function buildUpstreamHeaders(
   headers: Record<string, string | string[] | undefined>,
-  options: { forwardAuthorization?: boolean } = {},
+  options: {
+    forwardAuthorization?: boolean;
+    forwardHeaders?: Iterable<string> | undefined;
+  } = {},
 ): Record<string, string> {
+  const extraHeaders = options.forwardHeaders
+    ? new Set(Array.from(options.forwardHeaders, (h) => h.toLowerCase().trim()).filter(Boolean))
+    : undefined;
   const out: Record<string, string> = {};
+  const allowlist = options.allowedHeaders
+    ? new Set(Array.from(options.allowedHeaders).map((h) => h.toLowerCase()))
+    : undefined;
   for (const [key, value] of Object.entries(headers)) {
     if (value === undefined) continue;
     const lower = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
-    if (lower === 'authorization' && options.forwardAuthorization !== true) continue;
     if (lower.startsWith('x-keylease-')) continue;
     // Forwarding metadata is rebuilt by the proxy from trusted values only.
     if (lower.startsWith('x-forwarded-')) continue;
-    out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
+    if (lower === 'authorization') {
+      if (options.forwardAuthorization === true) {
+        out[lower] = Array.isArray(value) ? value.join(', ') : value;
+      }
+      continue;
+    }
+    if (isAllowedForwardHeader(lower, extraHeaders)) {
+      out[lower] = Array.isArray(value) ? value.join(lower === 'cookie' ? '; ' : ', ') : value;
+    }
   }
   return out;
 }
@@ -191,21 +268,20 @@ function allowsBody(method: string): boolean {
 }
 
 /**
- * Copies upstream response headers onto the Fastify reply.
+ * Copies upstream response headers minus hop-by-hop and encoding headers.
  *
- * Repeated field names are accumulated rather than overwritten: Fetch folds
- * duplicates into a single comma-joined value for most names, but not every
- * runtime does, and a second `vary`, `link` or `warning` field must survive the
- * proxy (RFC 9110 §5.3 allows combining them with `, `). `set-cookie` is the
- * exception — it is never folded, so it keeps using `getSetCookie()` and each
- * cookie stays on its own field line.
+ * `content-encoding` is dropped because the body handed to Fastify has already
+ * been decoded by `fetch` (see {@link DROPPED_RESPONSE_HEADERS}); `content-length`
+ * is dropped with the hop-by-hop set and regenerated by Fastify for the actual
+ * payload, including the empty bodies of HEAD, 204 and 304 responses.
  */
-export function copyResponseHeaders(reply: FastifyReply, headers: Headers): void {
-  const accumulated = new Map<string, string[]>();
+function copyResponseHeaders(reply: FastifyReply, headers: Headers): void {
   const setCookies = typeof headers.getSetCookie === 'function' ? headers.getSetCookie() : [];
   for (const [key, value] of headers) {
     const lower = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (DROPPED_RESPONSE_HEADERS.has(lower)) continue;
+    if (HOP_BY_HOP_HEADERS.has(lower) && lower !== 'content-length') continue;
     if (lower === 'set-cookie') continue;
     if (value === undefined) continue;
     const values = accumulated.get(lower);
@@ -382,8 +458,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
   const { verifier, upstream } = options;
   const fetchImpl: typeof fetch = options.fetchImpl ?? globalThis.fetch;
   const forwardAuthorization = options.forwardAuthorization === true;
-  const requestTimeoutMs = options.requestTimeoutMs ?? 15_000;
-  const cors = normalizeCors(options.cors);
+  const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const verificationRetryAfterSeconds = Math.max(
     1,
     Math.ceil(Math.min(verifier.cacheTtlMs, 30_000) / 1_000),
@@ -419,6 +494,12 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
   app.addHook('onRequest', async (request, reply) => {
     inFlightRequests += 1;
+    // Strip client-supplied x-keylease-* headers before verification runs.
+    for (const key of Object.keys(request.headers)) {
+      if (key.toLowerCase().startsWith('x-keylease-')) {
+        delete request.headers[key];
+      }
+    }
     reply.header(REQUEST_ID_HEADER, request.id);
   });
 
@@ -537,6 +618,22 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
           message: 'protocol upgrades (e.g. WebSocket) are not supported by this proxy',
         });
     }
+
+    if (!circuitBreaker.canAttempt()) {
+      metrics.requestsDenied.set(
+        'upstream_unavailable',
+        (metrics.requestsDenied.get('upstream_unavailable') ?? 0) + 1,
+      );
+      return reply
+        .code(503)
+        .header('retry-after', String(circuitBreaker.getRetryAfterSeconds()))
+        .type('application/json; charset=utf-8')
+        .send({
+          error: 'upstream_unavailable',
+          message: 'upstream circuit breaker is open',
+        });
+    }
+
     const decision = await verifier.verifyAuthorization(request.headers.authorization);
     if (!decision.ok) {
       metrics.requestsDenied.set(
@@ -550,6 +647,8 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
       const deniedReply = reply.code(decision.status).type('application/json; charset=utf-8');
       if (decision.status === 503) {
         deniedReply.header('retry-after', String(verificationRetryAfterSeconds));
+      } else if (decision.status === 429 && decision.retryAfter !== undefined) {
+        deniedReply.header('retry-after', String(decision.retryAfter));
       }
       return deniedReply.send({ error: decision.reason, message: decision.message });
     }
@@ -558,7 +657,10 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
     const target = resolveUpstreamUrl(upstream, request.raw.url ?? '/');
     const method = request.method;
-    const headers = buildUpstreamHeaders(request.headers, { forwardAuthorization });
+    const headers = buildUpstreamHeaders(request.headers, {
+      forwardAuthorization,
+      forwardHeaders,
+    });
     const payload =
       allowsBody(method) && Buffer.isBuffer(request.body) && request.body.length > 0
         ? request.body
@@ -591,6 +693,7 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
         timeoutSignal === undefined
           ? clientAbortController.signal
           : AbortSignal.any([timeoutSignal, clientAbortController.signal]),
+      redirect: 'manual',
     };
 
     try {
@@ -600,7 +703,15 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
       let response: Response;
       try {
         response = await fetchImpl(target, init);
+        if (response.status >= 500) {
+          circuitBreaker.recordFailure();
+        } else {
+          circuitBreaker.recordSuccess();
+        }
       } catch (error) {
+        if (!clientAbortController.signal.aborted) {
+          circuitBreaker.recordFailure();
+        }
         recordLatency((performance.now() - startTime) / 1000);
         if (clientAbortController.signal.aborted) return reply;
         const timedOut =
@@ -625,24 +736,49 @@ export function buildProxyServer(options: ProxyOptions): FastifyInstance {
 
       const emptyBody =
         method === 'HEAD' || response.status === 204 || response.status === 304;
-      if (emptyBody) {
+      if (emptyBody || response.body === null) {
         return reply.send();
       }
 
-      let responseBody: ArrayBuffer;
-      try {
-        responseBody = await response.arrayBuffer();
-      } catch (error) {
-        if (clientAbortController.signal.aborted) return reply;
-        throw error;
-      }
-      if (clientAbortController.signal.aborted) return reply;
       if (!response.headers.has('content-type')) {
         reply.type('application/octet-stream');
       }
-      return reply.send(Buffer.from(responseBody));
-    } finally {
+
+      const webStream = response.body;
+      const cancelUpstream = () => {
+        try {
+          webStream.cancel().catch(() => {});
+        } catch {
+          // stream might already be closed/cancelled
+        }
+      };
+
+      if (clientAbortController.signal.aborted) {
+        cancelUpstream();
+        return reply;
+      }
+      clientAbortController.signal.addEventListener('abort', cancelUpstream, { once: true });
+      request.raw.once('close', () => {
+        if (!reply.raw.writableEnded) {
+          cancelUpstream();
+          clientAbortController.abort();
+        }
+      });
+      reply.raw.once('close', () => {
+        if (!reply.raw.writableEnded) {
+          cancelUpstream();
+          clientAbortController.abort();
+        }
+      });
+      reply.raw.once('finish', () => {
+        socket.off('close', abortOnDisconnect);
+      });
+
+      const nodeStream = Readable.fromWeb(webStream as WebReadableStream);
+      return reply.send(nodeStream);
+    } catch (error) {
       socket.off('close', abortOnDisconnect);
+      throw error;
     }
   };
 

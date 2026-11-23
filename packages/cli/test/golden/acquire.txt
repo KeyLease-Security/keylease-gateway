@@ -1,0 +1,9 @@
+Lease 17 acquired for service "weather-api"
+  consumer   : <ADDRESS>
+  calls      : 3 (prepaid into contract escrow)
+  price paid : 15000
+  price/call : 5000
+  expires at : <TIMESTAMP>
+  tx hash    : <HASH>
+
+  Authorization: Bearer <SESSION_TOKEN>

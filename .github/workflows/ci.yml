@@ -6,19 +6,237 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   quality:
-    name: lint · typecheck · test
+    name: lint · typecheck · test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # pnpm version comes from the "packageManager" field in package.json
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build
+
+      # Exercises the built artifact, not the source modules: the proxy must
+      # start with a minimal environment, reject a protected request with
+      # 401 missing_token, and exit cleanly on SIGTERM without writing to
+      # stderr.
+      - name: Smoke test built proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          entrypoint="packages/proxy/dist/index.js"
+          if [ ! -f "$entrypoint" ]; then
+            echo "::error::built proxy entrypoint $entrypoint is missing"
+            exit 1
+          fi
+
+          work_dir="$(mktemp -d)"
+          stdout_log="$work_dir/proxy.stdout.log"
+          stderr_log="$work_dir/proxy.stderr.log"
+          : >"$stdout_log"
+          : >"$stderr_log"
+
+          proxy_pid=""
+          cleanup() {
+            local status=$?
+            if [ -n "$proxy_pid" ] && kill -0 "$proxy_pid" 2>/dev/null; then
+              kill -TERM "$proxy_pid" 2>/dev/null || true
+              for _ in $(seq 1 20); do
+                kill -0 "$proxy_pid" 2>/dev/null || break
+                sleep 0.1
+              done
+              kill -KILL "$proxy_pid" 2>/dev/null || true
+            fi
+            if [ -n "$proxy_pid" ]; then
+              wait "$proxy_pid" 2>/dev/null || true
+            fi
+            if [ "$status" -ne 0 ]; then
+              echo "::group::proxy stdout"
+              cat "$stdout_log" || true
+              echo "::endgroup::"
+              echo "::group::proxy stderr"
+              cat "$stderr_log" || true
+              echo "::endgroup::"
+            fi
+            rm -rf "$work_dir"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          assert_clean_stderr() {
+            if [ -s "$stderr_log" ]; then
+              echo "::error::proxy wrote unexpected output to stderr"
+              cat "$stderr_log"
+              exit 1
+            fi
+          }
+
+          # Minimal configuration:
+          #   - a stub upstream that is never contacted (the request is denied
+          #     before any forwarding happens),
+          #   - a syntactically valid contract id (only its StrKey checksum is
+          #     validated at startup; the 401 path makes no RPC call),
+          #   - PORT=0 so the kernel assigns an ephemeral port.
+          KEYLEASE_UPSTREAM_URL="http://127.0.0.1:9" \
+          KEYLEASE_CONTRACT_ID="CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC" \
+          KEYLEASE_NETWORK="local" \
+          HOST="127.0.0.1" \
+          PORT="0" \
+            node "$entrypoint" >"$stdout_log" 2>"$stderr_log" &
+          proxy_pid=$!
+
+          # Readiness: wait (bounded) for the port the proxy logs once listening.
+          port=""
+          deadline=$((SECONDS + 15))
+          while [ -z "$port" ]; do
+            if ! kill -0 "$proxy_pid" 2>/dev/null; then
+              echo "::error::proxy exited before it started listening"
+              exit 1
+            fi
+            port="$(sed -n 's/.*"msg":"listening on http:\/\/127\.0\.0\.1:\([0-9]\{1,5\}\)".*/\1/p' "$stdout_log" | head -n1)"
+            if [ -n "$port" ]; then
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::proxy did not start listening within 15s"
+              exit 1
+            fi
+            sleep 0.1
+          done
+
+          echo "proxy listening on ephemeral port $port"
+          assert_clean_stderr
+
+          # A protected route without an Authorization header must be denied by
+          # the documented 401 response, not forwarded upstream.
+          PROXY_PORT="$port" node --input-type=module <<'NODE'
+          const url = `http://127.0.0.1:${process.env.PROXY_PORT}/v1/weather`;
+          const response = await fetch(url);
+          const body = await response.text();
+
+          if (response.status !== 401) {
+            console.error(`expected status 401 from ${url}, got ${response.status}: ${body}`);
+            process.exit(1);
+          }
+
+          let payload;
+          try {
+            payload = JSON.parse(body);
+          } catch {
+            console.error(`expected a JSON body from ${url}, got: ${body}`);
+            process.exit(1);
+          }
+
+          if (payload?.error !== 'missing_token') {
+            console.error(`expected error "missing_token" from ${url}, got: ${body}`);
+            process.exit(1);
+          }
+
+          console.log(`smoke: ${url} -> 401 ${body}`);
+          NODE
+
+          assert_clean_stderr
+
+          # SIGTERM must drain and exit 0. A watchdog bounds the wait so a hung
+          # shutdown fails the step instead of blocking the job.
+          ( sleep 10; kill -KILL "$proxy_pid" 2>/dev/null ) &
+          watchdog_pid=$!
+          kill -TERM "$proxy_pid"
+          exit_code=0
+          wait "$proxy_pid" || exit_code=$?
+          proxy_pid=""
+          kill "$watchdog_pid" 2>/dev/null || true
+          wait "$watchdog_pid" 2>/dev/null || true
+
+          if [ "$exit_code" -ne 0 ]; then
+            echo "::error::proxy did not exit cleanly on SIGTERM (status $exit_code)"
+            exit 1
+          fi
+          assert_clean_stderr
+          echo "smoke: built proxy exited cleanly on SIGTERM"
+
+      - name: Typecheck (tsc --noEmit)
+        run: pnpm -r typecheck
+
+      - name: Test
+        run: pnpm -r exec vitest run --coverage
+
+      - name: Upload coverage summaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pull-request-coverage
+          path: |
+            packages/*/coverage/coverage-summary.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: packages/*/coverage
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: |
+            packages/*/coverage
+            packages/*/dist
+          if-no-files-found: ignore
+          retention-days: 7
+
+  pr-title:
+    name: PR title · conventional commits
+    # Dependabot PRs carry generated titles; their content is reviewed like any
+    # other change. Every contributor PR, including forks, is validated.
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # pnpm version comes from the "packageManager" field in package.json
       - name: Setup pnpm
@@ -33,28 +251,47 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Lint
-        run: pnpm lint
+      # The pull request title is the message that lands on main for a squash
+      # merge, so it is what this check validates. The rules live in
+      # commitlint.config.mjs and scripts/conventional-commits.mjs.
+      - name: Validate the pull request title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
 
-      - name: Build
-        run: pnpm build
+          # Titles generated from merge commits are not authored messages.
+          if [[ "$PR_TITLE" == Merge\ * ]]; then
+            echo "Skipping: merge-commit title."
+            exit 0
+          fi
 
-      - name: Typecheck (tsc --noEmit)
-        run: pnpm -r typecheck
+          if [[ -z "${PR_TITLE//[[:space:]]/}" ]]; then
+            echo "::error::The pull request title is empty; use '<type>(<scope>): <subject>'."
+            exit 1
+          fi
 
-      - name: Test
-        run: pnpm test
+          status=0
+          printf '%s\n' "$PR_TITLE" | pnpm exec commitlint --config commitlint.config.mjs || status=$?
+          if [[ $status -eq 0 ]]; then
+            echo "PR title follows Conventional Commits."
+            exit 0
+          fi
 
-      - name: Upload test output on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-output
-          path: |
-            packages/*/coverage
-            packages/*/dist
-          if-no-files-found: ignore
-          retention-days: 7
+          suggestion="$(node scripts/pr-title-suggestion.mjs "$PR_TITLE" 2>/dev/null || echo 'feat: describe the change')"
+          echo "::error::PR title must follow Conventional Commits. Suggested title: $suggestion"
+          {
+            echo '### PR title does not follow Conventional Commits'
+            echo
+            echo 'The pull request title is validated by CI. Use this title instead:'
+            echo
+            echo '```text'
+            echo "$suggestion"
+            echo '```'
+            echo
+            echo 'See [CONTRIBUTING.md](https://github.com/${{ github.repository }}/blob/main/CONTRIBUTING.md#commit-messages-and-pr-titles).'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
   contract:
     name: contract · test · wasm
@@ -69,11 +306,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32v1-none
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts/keylease-core
+
+      - name: Cargo fmt check
+        run: cargo fmt --manifest-path contracts/keylease-core/Cargo.toml --check
+
+      - name: Cargo clippy
+        run: cargo clippy --manifest-path contracts/keylease-core/Cargo.toml --all-targets -- -D warnings
 
       # soroban-sdk 29 requires stellar-cli to produce a deployable wasm
       - name: Install stellar-cli
@@ -90,6 +334,35 @@ jobs:
       - name: Build contract wasm
         run: cd contracts/keylease-core && stellar contract build
 
+      - name: Enforce contract wasm size budget
+        env:
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          WASM="contracts/keylease-core/target/wasm32v1-none/release/keylease_core.wasm"
+          if [ ! -f "$WASM" ]; then
+            echo "::error::Built wasm artifact not found at $WASM"
+            exit 1
+          fi
+
+          SIZE=$(wc -c < "$WASM")
+          MAX_SIZE=20480 # 20 KB budget
+
+          echo "Contract wasm size: ${SIZE} bytes (budget: ${MAX_SIZE} bytes / 20 KB)"
+
+          # Check if the pull request carries the explicit override label
+          if echo "$PR_LABELS" | grep -q "wasm-size-override"; then
+            echo "⚠️ 'wasm-size-override' label detected on pull request. Bypassing size budget enforcement."
+            exit 0
+          fi
+
+          if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+            echo "::error::Contract wasm (${SIZE} bytes) exceeds the budget of ${MAX_SIZE} bytes (20 KB)."
+            echo "::error::To override this check for exceptional changes, add the 'wasm-size-override' label to the PR with a documented justification."
+            exit 1
+          fi
+
+          echo "✅ Contract wasm is within budget (${SIZE} <= ${MAX_SIZE} bytes)."
+
       - name: Upload contract wasm
         uses: actions/upload-artifact@v4
         with:
@@ -97,3 +370,24 @@ jobs:
           path: contracts/keylease-core/target/wasm32v1-none/release/keylease_core.wasm
           if-no-files-found: error
           retention-days: 30
+
+  actionlint:
+    name: workflows · actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.7"
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" | tar -xz -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Run actionlint
+        run: actionlint

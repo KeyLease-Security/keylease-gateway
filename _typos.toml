@@ -1,0 +1,21 @@
+[default.extend-words]
+ed25519 = "ed25519"
+Soroban = "Soroban"
+Stellar = "Stellar"
+stroops = "stroops"
+XLM = "XLM"
+
+[files]
+extend-exclude = [
+  "**/*.lock",
+  "**/*-lock.yaml",
+  "**/*-lock.yml",
+  "**/package-lock.json",
+  "**/node_modules/**",
+  "**/target/**",
+  "**/dist/**",
+  "**/build/**",
+  "**/coverage/**",
+  "**/*.tsbuildinfo",
+  "**/test_snapshots/**",
+]
