@@ -298,6 +298,22 @@ friendbot, writes `deployments.json` (public) and
 
 ---
 
+## Proxy benchmarks
+
+Run the deterministic verifier, quota and header benchmarks with:
+
+```bash
+pnpm --filter @keylease/proxy bench
+node scripts/benchmark-report.mjs \
+  packages/proxy/benchmark-results.json \
+  packages/proxy/benchmark-baseline.json
+```
+
+The suite uses fixed in-process lease state and a fixed signing key; it makes
+no network or RPC calls. Results are reported in operations per second.
+A negative percentage in the baseline column means slower throughput. Recalibrate
+`benchmark-baseline.json` only when an intentional performance change is accepted.
+
 ## CLI reference
 
 | Command | Purpose |
