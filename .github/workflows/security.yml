@@ -167,6 +167,50 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  pnpm-advisory-tracker:
+    name: dependencies · weekly tracking issue
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit workspace lockfile
+        shell: bash
+        run: |
+          set +e
+          pnpm audit --audit-level=high --json > "$RUNNER_TEMP/pnpm-audit.json"
+          status=$?
+          set -e
+          echo "$status" > "$RUNNER_TEMP/pnpm-audit.status"
+          echo "pnpm audit exit status: $status"
+
+      - name: Parse advisories and update tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status="$(cat "$RUNNER_TEMP/pnpm-audit.status")"
+          node scripts/audit-report.mjs "$RUNNER_TEMP/pnpm-audit.json" "$status"
+
   rust-advisories:
     name: contract · advisories · cargo-deny
     runs-on: ubuntu-latest

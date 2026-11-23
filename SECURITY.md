@@ -93,6 +93,22 @@ Report upgrade-path bugs (an upgrade without the admin, a bypass of the hash
 check, storage corruption across an upgrade) through the private channel
 above; they are in scope.
 
+## Dependency audit triage policy
+
+The workspace lockfile is audited weekly and on manual security runs. A
+high or critical pnpm advisory is tracked in one GitHub issue titled
+`security: pnpm audit high and critical advisories`; the automation updates
+that issue instead of opening duplicates.
+
+- Maintainers assess affected runtime exposure, package reachability and
+  whether a fixed package version is available.
+- Advisories with a fixed release are resolved by upgrading the lockfile and
+  closing or updating the tracking issue in the same change.
+- Advisories without a fixed release are risk-assessed and either temporarily
+  mitigated, accepted for a documented period, or escalated for replacement.
+- Audit command failures are operational failures. Advisory findings alone
+  do not fail the audit workflow.
+
 ## Audit status
 
 This software is **pre-1.0 and has not been independently audited**. Use it for
