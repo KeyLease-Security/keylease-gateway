@@ -21,7 +21,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "bench": "vitest bench --run --outputJson benchmark-results.json"
   },
   "dependencies": {
     "@keylease/cli": "workspace:*",

@@ -222,6 +222,55 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  benchmarks:
+    name: proxy · benchmarks · trend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run proxy benchmarks
+        run: pnpm --filter @keylease/proxy bench
+
+      - name: Report benchmark delta
+        env:
+          GITHUB_STEP_SUMMARY: ${{ runner.temp }}/benchmark-summary.md
+        run: node scripts/benchmark-report.mjs packages/proxy/benchmark-results.json packages/proxy/benchmark-baseline.json benchmark-trend.md
+
+      - name: Comment benchmark trend on PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file benchmark-trend.md
+
+      - name: Upload benchmark trend
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-benchmark-trend
+          path: |
+            packages/proxy/benchmark-results.json
+            benchmark-trend.md
+          if-no-files-found: ignore
+          retention-days: 30
+
   pr-title:
     name: PR title · conventional commits
     # Dependabot PRs carry generated titles; their content is reviewed like any

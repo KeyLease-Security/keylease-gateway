@@ -15,6 +15,7 @@
     "lint": "eslint .",
     "commitlint": "commitlint --config commitlint.config.mjs",
     "test": "pnpm -r test && vitest run scripts",
+    "benchmark": "pnpm --filter @keylease/proxy bench && node scripts/benchmark-report.mjs packages/proxy/benchmark-results.json packages/proxy/benchmark-baseline.json",
     "test:watch": "pnpm -r --parallel test:watch",
     "clean": "pnpm -r exec rm -rf dist coverage *.tsbuildinfo",
     "contract:build": "cd contracts/keylease-core && stellar contract build",
