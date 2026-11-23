@@ -1,8 +1,8 @@
 extern crate std;
 
 use crate::{
-    Error, KeyleaseCore, KeyleaseCoreClient, Lease, CONTRACT_VERSION, MAX_LEASE_DURATION,
-    MAX_SERVICE_LEN, MIN_SERVICE_LEN,
+    calculate_payout, Error, KeyleaseCore, KeyleaseCoreClient, Lease, CONTRACT_VERSION,
+    MAX_LEASE_DURATION, MAX_SERVICE_LEN, MIN_SERVICE_LEN,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
@@ -62,6 +62,20 @@ fn register(h: &Harness) {
 
 fn balance(h: &Harness, who: &Address) -> i128 {
     TokenClient::new(&h.env, &h.token).balance(who)
+}
+
+#[test]
+fn payout_checked_arithmetic_near_i128_max_and_zero_usage() {
+    let (payable, refund) = calculate_payout(i128::MAX, 1, 3).unwrap();
+    assert_eq!(payable.checked_add(refund), Some(i128::MAX));
+
+    let err = calculate_payout(i128::MAX, u32::MAX, 1).unwrap_err();
+    assert_eq!(err, Error::InvalidAmount);
+
+    let (payable, refund) = calculate_payout(i128::MAX, 0, 10).unwrap();
+    assert_eq!(payable, 0);
+    assert_eq!(refund, i128::MAX);
+    assert_eq!(payable + refund, i128::MAX);
 }
 
 #[test]
