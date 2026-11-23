@@ -20,6 +20,7 @@ contracts/**/*.cdx.json
 # Test / coverage
 coverage/
 .vitest/
+benchmark-results.json
 
 # Environment & secrets
 .env

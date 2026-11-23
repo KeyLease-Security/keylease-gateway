@@ -218,6 +218,22 @@ export KEYLEASE_UPSTREAM_URL=https://api.example.com
 export KEYLEASE_GATEWAY_SECRET="$KEYLEASE_GATEWAY_SECRET"   # registered gateway
 node packages/proxy/dist/index.js
 
+## Run the proxy container
+
+Published proxy images are available from GHCR for every `v*` release:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e KEYLEASE_UPSTREAM_URL=https://api.example.com \
+  -e KEYLEASE_CONTRACT_ID=CC2YHTV3ZOFZJGQ5ACJAZRY46JDAF4ZUWOBMFZTSMQAFIW4UOXDA3KRC \
+  -e KEYLEASE_NETWORK=testnet \
+  ghcr.io/keylease-security/keylease-gateway/proxy:v0.1.0
+```
+
+The container listens on port `8080` and exposes `GET /healthz` for
+readiness checks. Set `KEYLEASE_GATEWAY_SECRET` only on instances that should
+commit batched `use_call` quota updates on chain.
+
 # 5. call through it
 curl -H "Authorization: Bearer $KEYLEASE_SESSION_TOKEN" http://localhost:8080/v1/weather
 #   < x-keylease-lease-id: 2
@@ -281,6 +297,22 @@ friendbot, writes `deployments.json` (public) and
 `.keylease/testnet-accounts.json` (git-ignored secret seeds).
 
 ---
+
+## Proxy benchmarks
+
+Run the deterministic verifier, quota and header benchmarks with:
+
+```bash
+pnpm --filter @keylease/proxy bench
+node scripts/benchmark-report.mjs \
+  packages/proxy/benchmark-results.json \
+  packages/proxy/benchmark-baseline.json
+```
+
+The suite uses fixed in-process lease state and a fixed signing key; it makes
+no network or RPC calls. Results are reported in operations per second.
+A negative percentage in the baseline column means slower throughput. Recalibrate
+`benchmark-baseline.json` only when an intentional performance change is accepted.
 
 ## CLI reference
 
