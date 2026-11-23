@@ -7,6 +7,9 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   buildProxyServer,
   buildUpstreamHeaders,
+  copyResponseHeaders,
+  isCorsPreflight,
+  proxyClientErrorHandler,
   resolveUpstreamUrl,
   drainProxyServer,
 } from './server.js';
@@ -581,6 +584,72 @@ describe('proxy routing', () => {
       client.destroy();
       await app.close();
     }
+  });
+
+  it('preserves repeated vary and link headers alongside multiple set-cookie headers', async () => {
+    const headers = new Headers();
+    headers.append('vary', 'Accept-Encoding');
+    headers.append('vary', 'Accept-Language');
+    headers.append('link', '<https://api.example.com/v1?page=2>; rel="next"');
+    headers.append('link', '<https://api.example.com/v1?page=9>; rel="last"');
+    headers.append('set-cookie', 'a=1; Path=/');
+    headers.append('set-cookie', 'b=2; Path=/');
+    const { impl } = stubFetch(async () => new Response('ok', { status: 200, headers }));
+
+    const app = buildProxyServer({
+      upstream: 'https://api.example.com',
+      verifier: makeVerifier({ getLeaseState: async () => leaseState() }),
+      fetchImpl: impl,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/v1/data',
+      headers: { authorization: `Bearer ${mintToken()}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(String(res.headers['vary'])).toContain('Accept-Encoding');
+    expect(String(res.headers['vary'])).toContain('Accept-Language');
+    expect(String(res.headers['link'])).toContain('page=2');
+    expect(String(res.headers['link'])).toContain('page=9');
+    const setCookie = res.headers['set-cookie'];
+    const cookies = Array.isArray(setCookie) ? setCookie : [String(setCookie)];
+    expect(cookies.join(' ')).toContain('a=1');
+    expect(cookies.join(' ')).toContain('b=2');
+    await app.close();
+  });
+
+  it('appends repeated header names instead of overwriting them', () => {
+    const written: Record<string, string | string[]> = {};
+    const fakeReply = {
+      header(key: string, value: string) {
+        if (key === 'set-cookie') {
+          const previous = written[key];
+          written[key] =
+            previous === undefined
+              ? [value]
+              : (Array.isArray(previous) ? previous : [previous]).concat(value);
+        } else {
+          written[key] = value;
+        }
+        return fakeReply;
+      },
+    };
+    const repeated = {
+      *[Symbol.iterator]() {
+        yield ['vary', 'Accept-Encoding'] as [string, string];
+        yield ['vary', 'Accept-Language'] as [string, string];
+        yield ['set-cookie', 'a=1'] as [string, string];
+        yield ['set-cookie', 'b=2'] as [string, string];
+      },
+      getSetCookie: () => ['a=1', 'b=2'],
+    } as unknown as Headers;
+
+    copyResponseHeaders(fakeReply as never, repeated);
+
+    expect(written['vary']).toBe('Accept-Encoding, Accept-Language');
+    expect(written['set-cookie']).toEqual(['a=1', 'b=2']);
   });
 
   it('forwards multi-value Set-Cookie headers', async () => {

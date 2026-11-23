@@ -18,6 +18,13 @@
  *   KEYLEASE_UPSTREAM_TIMEOUT_MS per-request upstream timeout in ms; 0 disables
  *                            (default: 15000)
  *   KEYLEASE_MAX_BODY_BYTES  maximum request body size in bytes (default: 33554432)
+ *   KEYLEASE_KEEP_ALIVE_TIMEOUT_MS inbound socket keep-alive window (default: 72000)
+ *   KEYLEASE_REQUEST_TIMEOUT_MS    deadline to receive a whole request (default: 300000);
+ *                                  expiry returns 408 request_timeout
+ *   KEYLEASE_CORS_ALLOWED_ORIGINS  comma-separated origins or "*" (default: *)
+ *   KEYLEASE_CORS_ALLOWED_HEADERS  comma-separated request header allowlist
+ *   KEYLEASE_CORS_ALLOW_CREDENTIALS "true" to send allow-credentials (needs explicit origins)
+ *   KEYLEASE_CORS_MAX_AGE_SECONDS  preflight cache lifetime (default: 600)
  *   KEYLEASE_TRUST_PROXY     trusted edge proxies for x-forwarded-*: "true", a hop count or
  *                            a comma-separated IP/CIDR list (default: false)
  *   KEYLEASE_MAX_INFLIGHT    max concurrent proxied requests; excess get 503 + Retry-After
@@ -103,11 +110,41 @@ export interface ResolvedConfig {
 export const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024; // 32 MiB
 export const MAX_BODY_BYTES_LIMIT = 1024 * 1024 * 1024; // 1 GiB
 
-function positiveInt(raw: string | undefined, fallback: number, name: string): number {
+/** Hard ceiling for the lease-state cache TTL: 5 minutes. */
+export const MAX_CACHE_TTL_MS = 5 * 60 * 1000;
+/** Hard ceiling for the periodic quota flush interval: 5 minutes. */
+export const MAX_QUOTA_FLUSH_MS = 5 * 60 * 1000;
+/** Hard ceiling for the buffered quota batch size. */
+export const MAX_QUOTA_BATCH = 10_000;
+
+export const DEFAULT_KEEP_ALIVE_TIMEOUT_MS = 72_000;
+export const MAX_KEEP_ALIVE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
+export const DEFAULT_REQUEST_TIMEOUT_MS = 300_000;
+export const MAX_REQUEST_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
+
+export const DEFAULT_CORS_MAX_AGE_SECONDS = 600;
+export const MAX_CORS_MAX_AGE_SECONDS = 86_400; // 24 hours
+
+const CORS_ORIGIN_WILDCARD = '*';
+const CORS_HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9a-z-]+$/;
+
+/**
+ * Parses an integer environment value, rejecting non-integers, values below
+ * `min` and values above `max` so configuration mistakes fail at startup.
+ */
+function boundedInt(
+  raw: string | undefined,
+  fallback: number,
+  name: string,
+  options: { min?: number; max?: number } = {},
+): number {
   if (raw === undefined) return fallback;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new ProxyConfigError(`${name} "${raw}" must be a positive integer`);
+  const min = options.min ?? 1;
+  const max = options.max ?? Number.MAX_SAFE_INTEGER;
+  if (!Number.isInteger(value) || value < min || value > max) {
+    const range = max === Number.MAX_SAFE_INTEGER ? `>= ${min}` : `between ${min} and ${max}`;
+    throw new ProxyConfigError(`${name} "${raw}" must be an integer ${range}`);
   }
   return value;
 }
@@ -162,24 +199,16 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     throw new ProxyConfigError(`PORT "${env.PORT ?? ''}" is not a valid port number`);
   }
 
-  const cacheTtlMs =
-    env.KEYLEASE_CACHE_TTL_MS === undefined ? 30_000 : Number(env.KEYLEASE_CACHE_TTL_MS);
-  if (!Number.isFinite(cacheTtlMs) || cacheTtlMs <= 0) {
-    throw new ProxyConfigError(
-      `KEYLEASE_CACHE_TTL_MS "${env.KEYLEASE_CACHE_TTL_MS ?? ''}" must be a positive number of milliseconds`,
-    );
-  }
+  const cacheTtlMs = boundedInt(env.KEYLEASE_CACHE_TTL_MS, 30_000, 'KEYLEASE_CACHE_TTL_MS', {
+    max: MAX_CACHE_TTL_MS,
+  });
 
-  const maxBodyBytes = positiveInt(
+  const maxBodyBytes = boundedInt(
     env.KEYLEASE_MAX_BODY_BYTES,
     DEFAULT_MAX_BODY_BYTES,
     'KEYLEASE_MAX_BODY_BYTES',
+    { max: MAX_BODY_BYTES_LIMIT },
   );
-  if (maxBodyBytes > MAX_BODY_BYTES_LIMIT) {
-    throw new ProxyConfigError(
-      `KEYLEASE_MAX_BODY_BYTES "${env.KEYLEASE_MAX_BODY_BYTES}" exceeds maximum allowed limit of 1 GiB (${MAX_BODY_BYTES_LIMIT} bytes)`,
-    );
-  }
 
   const maxInFlight =
     env.KEYLEASE_MAX_INFLIGHT === undefined
@@ -226,14 +255,18 @@ export function resolveConfig(env: ProxyEnv): ResolvedConfig {
     forwardHeaders: parseForwardHeaders(env.KEYLEASE_FORWARD_HEADERS),
     trustProxy: parseTrustProxy(env.KEYLEASE_TRUST_PROXY),
     metricsEnabled: env.KEYLEASE_METRICS_ENABLED === 'true',
-    shutdownTimeoutMs: positiveInt(
+    shutdownTimeoutMs: boundedInt(
       env.KEYLEASE_SHUTDOWN_TIMEOUT_MS,
       10_000,
       'KEYLEASE_SHUTDOWN_TIMEOUT_MS',
     ),
     gatewaySecret: env.KEYLEASE_GATEWAY_SECRET ?? null,
-    quotaBatch: positiveInt(env.KEYLEASE_QUOTA_BATCH, 50, 'KEYLEASE_QUOTA_BATCH'),
-    quotaFlushMs: positiveInt(env.KEYLEASE_QUOTA_FLUSH_MS, 10_000, 'KEYLEASE_QUOTA_FLUSH_MS'),
+    quotaBatch: boundedInt(env.KEYLEASE_QUOTA_BATCH, 50, 'KEYLEASE_QUOTA_BATCH', {
+      max: MAX_QUOTA_BATCH,
+    }),
+    quotaFlushMs: boundedInt(env.KEYLEASE_QUOTA_FLUSH_MS, 10_000, 'KEYLEASE_QUOTA_FLUSH_MS', {
+      max: MAX_QUOTA_FLUSH_MS,
+    }),
     maxBodyBytes,
     maxInFlight,
     serviceId,
