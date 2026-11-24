@@ -37,6 +37,10 @@ pnpm contract:build # stellar contract build -> wasm32v1-none
 > Start with the [troubleshooting guide](./docs/troubleshooting.md). User-facing
 > and contract changes need an entry in [CHANGELOG.md](./CHANGELOG.md).
 
+This workspace uses `pnpm-lock.yaml`. CI rejects tracked `package-lock.json`,
+`yarn.lock`, `bun.lockb` and `bun.lock` files anywhere in the repository.
+Run `pnpm install` from the workspace root to update the correct lockfile.
+
 ## Your first contribution: good first issues
 
 This is the full path from a fresh clone to a reviewable pull request. Output
