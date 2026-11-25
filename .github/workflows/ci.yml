@@ -14,6 +14,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lockfile-policy:
+    name: pnpm lockfile policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Reject tracked lockfiles from other package managers
+        shell: bash
+        run: |
+          set -euo pipefail
+          lockfiles="$(git ls-files -- ':(glob)**/package-lock.json' ':(glob)**/yarn.lock' ':(glob)**/bun.lockb' ':(glob)**/bun.lock')"
+          if [[ -n "$lockfiles" ]]; then
+            printf '%s\n' "$lockfiles"
+            echo "::error::Remove these tracked lockfiles and use the pnpm workspace setup in CONTRIBUTING.md."
+            exit 1
+          fi
+
   quality:
     name: lint · typecheck · test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
