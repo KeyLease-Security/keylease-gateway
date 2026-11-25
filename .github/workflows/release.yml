@@ -63,7 +63,7 @@ jobs:
         run: pnpm sbom --sbom-format cyclonedx --out release-assets/sbom-pnpm.cdx.json
 
       - name: Upload release bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-bundle
           path: |
@@ -140,7 +140,7 @@ jobs:
             release-assets/keylease-core.wasm
 
       - name: Upload contract bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: contract-bundle
           path: |
@@ -196,7 +196,7 @@ jobs:
             release-assets/keylease-core-wasm.attestation.jsonl
 
       - name: Upload attestation bundles
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: attestations
           path: release-assets/*.attestation.jsonl
